@@ -27,6 +27,7 @@ public sealed class HnswIndex
     private readonly List<int> _addSelected = new();
     private readonly List<int> _pruneSelected = new();
     private readonly Comparison<Candidate> _candidateComparison;
+    private float[] _storedVectors = Array.Empty<float>();
 
     /// <summary>Initializes a new HNSW index.</summary>
     /// <param name="dimension">Vector dimension. All indexed and query vectors must have this length.</param>
@@ -137,10 +138,11 @@ public sealed class HnswIndex
         }
 
         float[] originalVector = vector.ToArray();
-        float[] storedVector = PrepareVector(originalVector);
         int level = RandomLevel();
         int newIndex = _nodes.Count;
-        var node = new Node(id, storedVector, originalVector, level);
+        EnsureStoredCapacity(newIndex + 1);
+        PrepareVectorInto(vector, StoredSpanMutable(newIndex));
+        var node = new Node(id, originalVector, level);
         _nodes.Add(node);
         _ids.Add(id, newIndex);
 
@@ -152,18 +154,18 @@ public sealed class HnswIndex
         }
 
         int entryPoint = _entryPoint;
-        float entryDistance = Distance(storedVector, _nodes[entryPoint].Vector);
+        float entryDistance = Distance(StoredSpan(newIndex), StoredSpan(entryPoint));
 
         for (int layer = _maxLevel; layer > level; layer--)
         {
-            (entryPoint, entryDistance) = SearchGreedy(storedVector, entryPoint, entryDistance, layer);
+            (entryPoint, entryDistance) = SearchGreedy(StoredSpan(newIndex), entryPoint, entryDistance, layer);
         }
 
         int topLayer = Math.Min(level, _maxLevel);
         for (int layer = topLayer; layer >= 0; layer--)
         {
-            SearchLayer(storedVector, entryPoint, EfConstruction, layer);
-            SelectNeighbors(storedVector, _layerResult, MaxConnections(layer), _addSelected);
+            SearchLayer(StoredSpan(newIndex), entryPoint, EfConstruction, layer);
+            SelectNeighbors(_layerResult, MaxConnections(layer), _addSelected);
             foreach (int neighbor in _addSelected)
             {
                 node.Links[layer].Add(neighbor);
@@ -206,7 +208,7 @@ public sealed class HnswIndex
 
         float[] preparedQuery = PrepareVector(query);
         int entryPoint = _entryPoint;
-        float entryDistance = Distance(preparedQuery, _nodes[entryPoint].Vector);
+        float entryDistance = Distance(preparedQuery, StoredSpan(entryPoint));
         for (int layer = _maxLevel; layer > 0; layer--)
         {
             (entryPoint, entryDistance) = SearchGreedy(preparedQuery, entryPoint, entryDistance, layer);
@@ -241,13 +243,15 @@ public sealed class HnswIndex
         writer.Write(_maxLevel);
         writer.Write(_nodes.Count);
 
-        foreach (Node node in _nodes)
+        for (int n = 0; n < _nodes.Count; n++)
         {
+            Node node = _nodes[n];
             writer.Write(node.Id);
             writer.Write(node.Level);
+            ReadOnlySpan<float> stored = StoredSpan(n);
             for (int i = 0; i < Dimension; i++)
             {
-                writer.Write(node.Vector[i]);
+                writer.Write(stored[i]);
             }
             for (int i = 0; i < Dimension; i++)
             {
@@ -290,20 +294,20 @@ public sealed class HnswIndex
         int maxLevel = reader.ReadInt32();
         int count = reader.ReadInt32();
         var index = new HnswIndex(dimension, metric, m, efConstruction, ef, entryPoint, maxLevel);
+        index._storedVectors = count > 0 ? new float[count * dimension] : Array.Empty<float>();
 
         for (int i = 0; i < count; i++)
         {
             long id = reader.ReadInt64();
             int level = reader.ReadInt32();
-            var vector = new float[dimension];
+            Span<float> stored = index._storedVectors.AsSpan(i * dimension, dimension);
             for (int j = 0; j < dimension; j++)
             {
-                vector[j] = reader.ReadSingle();
+                stored[j] = reader.ReadSingle();
             }
-            float[] originalVector;
+            var originalVector = new float[dimension];
             if (version >= 2)
             {
-                originalVector = new float[dimension];
                 for (int j = 0; j < dimension; j++)
                 {
                     originalVector[j] = reader.ReadSingle();
@@ -311,10 +315,10 @@ public sealed class HnswIndex
             }
             else
             {
-                originalVector = (float[])vector.Clone();
+                stored.CopyTo(originalVector);
             }
 
-            var node = new Node(id, vector, originalVector, level);
+            var node = new Node(id, originalVector, level);
             int layerCount = reader.ReadInt32();
             if (layerCount != level + 1)
             {
@@ -360,13 +364,47 @@ public sealed class HnswIndex
         return copy;
     }
 
+    private void PrepareVectorInto(ReadOnlySpan<float> source, Span<float> destination)
+    {
+        source.CopyTo(destination);
+        if (Metric == DistanceMetric.Cosine)
+        {
+            float norm = MathF.Sqrt(TensorPrimitives.Dot(destination, destination));
+            if (norm > 0)
+            {
+                TensorPrimitives.Divide(destination, norm, destination);
+            }
+        }
+    }
+
+    private void EnsureStoredCapacity(int nodeCount)
+    {
+        int required = nodeCount * Dimension;
+        if (_storedVectors.Length >= required)
+        {
+            return;
+        }
+
+        int capacity = _storedVectors.Length == 0 ? Dimension * 16 : _storedVectors.Length * 2;
+        if (capacity < required)
+        {
+            capacity = required;
+        }
+
+        Array.Resize(ref _storedVectors, capacity);
+    }
+
+    private ReadOnlySpan<float> StoredSpan(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
+
+    private Span<float> StoredSpanMutable(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
+
     private int RandomLevel()
     {
         double sample = Math.Max(_random.NextDouble(), double.Epsilon);
         return (int)(-Math.Log(sample) * _levelMultiplier);
     }
 
-    private (int Index, float Distance) SearchGreedy(float[] query, int entryPoint, float entryDistance, int layer)
+    private (int Index, float Distance) SearchGreedy(ReadOnlySpan<float> query, int entryPoint, float entryDistance, int layer)
     {
         bool changed;
         do
@@ -374,7 +412,7 @@ public sealed class HnswIndex
             changed = false;
             foreach (int neighbor in _nodes[entryPoint].Links[layer])
             {
-                float distance = Distance(query, _nodes[neighbor].Vector);
+                float distance = Distance(query, StoredSpan(neighbor));
                 if (distance < entryDistance)
                 {
                     entryDistance = distance;
@@ -388,14 +426,14 @@ public sealed class HnswIndex
         return (entryPoint, entryDistance);
     }
 
-    private void SearchLayer(float[] query, int entryPoint, int ef, int layer)
+    private void SearchLayer(ReadOnlySpan<float> query, int entryPoint, int ef, int layer)
     {
         _visited.Clear();
         _candidatesQueue.Clear();
         _nearestQueue.Clear();
         _visited.Add(entryPoint);
 
-        float entryDistance = Distance(query, _nodes[entryPoint].Vector);
+        float entryDistance = Distance(query, StoredSpan(entryPoint));
         var entry = new Candidate(entryPoint, entryDistance);
         _candidatesQueue.Enqueue(entry, entryDistance);
         _nearestQueue.Enqueue(entry, -entryDistance);
@@ -416,7 +454,7 @@ public sealed class HnswIndex
                     continue;
                 }
 
-                float distance = Distance(query, _nodes[neighbor].Vector);
+                float distance = Distance(query, StoredSpan(neighbor));
                 if (_nearestQueue.Count < ef || distance < lowerBound)
                 {
                     var candidate = new Candidate(neighbor, distance);
@@ -442,7 +480,7 @@ public sealed class HnswIndex
         _layerResult.Sort(_candidateComparison);
     }
 
-    private void SelectNeighbors(float[] query, List<Candidate> candidates, int maxConnections, List<int> result)
+    private void SelectNeighbors(List<Candidate> candidates, int maxConnections, List<int> result)
     {
         result.Clear();
         _selectPruned.Clear();
@@ -452,7 +490,7 @@ public sealed class HnswIndex
             bool good = true;
             foreach (int selected in result)
             {
-                if (Distance(_nodes[candidate.Index].Vector, _nodes[selected].Vector) < candidate.Distance)
+                if (Distance(StoredSpan(candidate.Index), StoredSpan(selected)) < candidate.Distance)
                 {
                     good = false;
                     break;
@@ -495,14 +533,13 @@ public sealed class HnswIndex
             return;
         }
 
-        float[] vector = _nodes[nodeIndex].Vector;
         _pruneCandidates.Clear();
         foreach (int neighbor in links)
         {
-            _pruneCandidates.Add(new Candidate(neighbor, Distance(vector, _nodes[neighbor].Vector)));
+            _pruneCandidates.Add(new Candidate(neighbor, Distance(StoredSpan(nodeIndex), StoredSpan(neighbor))));
         }
 
-        SelectNeighbors(vector, _pruneCandidates, maxConnections, _pruneSelected);
+        SelectNeighbors(_pruneCandidates, maxConnections, _pruneSelected);
         links.Clear();
         links.AddRange(_pruneSelected);
     }
@@ -525,10 +562,9 @@ public sealed class HnswIndex
 
     private sealed class Node
     {
-        public Node(long id, float[] vector, float[] originalVector, int level)
+        public Node(long id, float[] originalVector, int level)
         {
             Id = id;
-            Vector = vector;
             OriginalVector = originalVector;
             Level = level;
             Links = new List<int>[level + 1];
@@ -539,8 +575,6 @@ public sealed class HnswIndex
         }
 
         public long Id { get; }
-
-        public float[] Vector { get; }
 
         public float[] OriginalVector { get; }
 
