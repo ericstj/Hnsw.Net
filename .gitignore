@@ -1,0 +1,10 @@
+# Build artifacts
+bin/
+obj/
+artifacts/
+BenchmarkDotNet.Artifacts/
+
+# Binary index files produced by local experiments
+*.hnsw
+*.bin
+!tests/Hnsw.Net.Tests/parity_vectors.bin

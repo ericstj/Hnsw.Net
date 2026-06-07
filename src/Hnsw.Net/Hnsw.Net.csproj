@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Optimize>true</Optimize>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>HnswNet</RootNamespace>
+    <AssemblyName>Hnsw.Net</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Packaging">
+    <PackageId>Hnsw.Net</PackageId>
+    <Version>0.1.0</Version>
+    <EnablePackageValidation>true</EnablePackageValidation>
+    <Authors>ericstj</Authors>
+    <Description>Pure managed HNSW approximate-nearest-neighbor search for .NET with SIMD-accelerated vector distances and no native dependency.</Description>
+    <PackageTags>hnsw;ann;nearest-neighbor;vector-search;similarity-search;machine-learning</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/ericstj/Hnsw.Net</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ericstj/Hnsw.Net</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\THIRD-PARTY-NOTICES.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" />
+  </ItemGroup>
+
+</Project>
