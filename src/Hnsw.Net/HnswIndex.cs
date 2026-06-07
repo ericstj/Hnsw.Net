@@ -1,5 +1,8 @@
 using System.Collections.ObjectModel;
+using System.Numerics;
 using System.Numerics.Tensors;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace HnswNet;
 
@@ -18,7 +21,8 @@ public sealed class HnswIndex
     private int _entryPoint = -1;
     private int _maxLevel = -1;
 
-    private readonly HashSet<int> _visited = new();
+    private int[] _visitedStamp = Array.Empty<int>();
+    private int _visitedVersion;
     private readonly PriorityQueue<Candidate, float> _candidatesQueue = new();
     private readonly PriorityQueue<Candidate, float> _nearestQueue = new();
     private readonly List<Candidate> _layerResult = new();
@@ -145,6 +149,10 @@ public sealed class HnswIndex
         var node = new Node(id, originalVector, level);
         _nodes.Add(node);
         _ids.Add(id, newIndex);
+        if (_visitedStamp.Length < _nodes.Count)
+        {
+            Array.Resize(ref _visitedStamp, Math.Max(16, _nodes.Count * 2));
+        }
 
         if (_entryPoint < 0)
         {
@@ -338,6 +346,7 @@ public sealed class HnswIndex
             index._nodes.Add(node);
         }
 
+        index._visitedStamp = count > 0 ? new int[count] : Array.Empty<int>();
         return index;
     }
 
@@ -394,6 +403,17 @@ public sealed class HnswIndex
         Array.Resize(ref _storedVectors, capacity);
     }
 
+    private int NextVisitedVersion()
+    {
+        if (++_visitedVersion == 0)
+        {
+            Array.Clear(_visitedStamp);
+            _visitedVersion = 1;
+        }
+
+        return _visitedVersion;
+    }
+
     private ReadOnlySpan<float> StoredSpan(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
 
     private Span<float> StoredSpanMutable(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
@@ -428,10 +448,10 @@ public sealed class HnswIndex
 
     private void SearchLayer(ReadOnlySpan<float> query, int entryPoint, int ef, int layer)
     {
-        _visited.Clear();
+        int version = NextVisitedVersion();
         _candidatesQueue.Clear();
         _nearestQueue.Clear();
-        _visited.Add(entryPoint);
+        _visitedStamp[entryPoint] = version;
 
         float entryDistance = Distance(query, StoredSpan(entryPoint));
         var entry = new Candidate(entryPoint, entryDistance);
@@ -449,11 +469,12 @@ public sealed class HnswIndex
 
             foreach (int neighbor in _nodes[current.Index].Links[layer])
             {
-                if (!_visited.Add(neighbor))
+                if (_visitedStamp[neighbor] == version)
                 {
                     continue;
                 }
 
+                _visitedStamp[neighbor] = version;
                 float distance = Distance(query, StoredSpan(neighbor));
                 if (_nearestQueue.Count < ef || distance < lowerBound)
                 {
@@ -487,10 +508,11 @@ public sealed class HnswIndex
         candidates.Sort(_candidateComparison);
         foreach (Candidate candidate in candidates)
         {
+            ReadOnlySpan<float> candidateSpan = StoredSpan(candidate.Index);
             bool good = true;
             foreach (int selected in result)
             {
-                if (Distance(StoredSpan(candidate.Index), StoredSpan(selected)) < candidate.Distance)
+                if (Distance(candidateSpan, StoredSpan(selected)) < candidate.Distance)
                 {
                     good = false;
                     break;
@@ -554,11 +576,39 @@ public sealed class HnswIndex
 
     private float Distance(ReadOnlySpan<float> left, ReadOnlySpan<float> right) => Metric switch
     {
-        DistanceMetric.Cosine => 1.0f - TensorPrimitives.Dot(left, right),
+        DistanceMetric.Cosine => 1.0f - DotProduct(left, right),
         DistanceMetric.EuclideanL2 => TensorPrimitives.Distance(left, right),
-        DistanceMetric.DotProduct => -TensorPrimitives.Dot(left, right),
+        DistanceMetric.DotProduct => -DotProduct(left, right),
         _ => throw new InvalidOperationException("Unknown distance metric."),
     };
+
+    private static float DotProduct(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
+    {
+        int width = Vector<float>.Count;
+        int n = a.Length;
+        ref float pa = ref MemoryMarshal.GetReference(a);
+        ref float pb = ref MemoryMarshal.GetReference(b);
+        var acc0 = Vector<float>.Zero;
+        var acc1 = Vector<float>.Zero;
+        int i = 0;
+        for (; i + 2 * width <= n; i += 2 * width)
+        {
+            acc0 += Vector.LoadUnsafe(ref pa, (nuint)i) * Vector.LoadUnsafe(ref pb, (nuint)i);
+            acc1 += Vector.LoadUnsafe(ref pa, (nuint)(i + width)) * Vector.LoadUnsafe(ref pb, (nuint)(i + width));
+        }
+        for (; i + width <= n; i += width)
+        {
+            acc0 += Vector.LoadUnsafe(ref pa, (nuint)i) * Vector.LoadUnsafe(ref pb, (nuint)i);
+        }
+
+        float sum = Vector.Sum(acc0 + acc1);
+        for (; i < n; i++)
+        {
+            sum += Unsafe.Add(ref pa, i) * Unsafe.Add(ref pb, i);
+        }
+
+        return sum;
+    }
 
     private sealed class Node
     {
