@@ -4,6 +4,8 @@ using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.VectorData;
 using Microsoft.Extensions.VectorData.ProviderServices;
@@ -345,29 +347,96 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
     /// <remarks>
     /// This is not part of the <see cref="VectorStoreCollection{TKey, TRecord}" /> abstraction;
     /// reach it by holding the concrete <see cref="HnswCollection{TKey, TRecord}" /> type.
+    /// This overload serializes records by reflection. For trimmed or NativeAOT applications,
+    /// use <see cref="Save(Stream, JsonSerializerContext)" /> with a source-generated context.
     /// </remarks>
-    [RequiresUnreferencedCode("Snapshot persistence serializes records by reflection and is incompatible with trimming.")]
-    [RequiresDynamicCode("Snapshot persistence serializes records by reflection and is incompatible with NativeAOT.")]
+    [RequiresUnreferencedCode("Snapshot persistence serializes records by reflection and is incompatible with trimming. Use the JsonSerializerContext overload for trimming/NativeAOT.")]
+    [RequiresDynamicCode("Snapshot persistence serializes records by reflection and is incompatible with NativeAOT. Use the JsonSerializerContext overload for trimming/NativeAOT.")]
     public void Save(Stream stream)
+        => SaveCore(stream, SerializeByReflection, SerializeByReflection);
+
+    /// <summary>
+    /// Provider-specific persistence, AOT- and trimming-safe. Writes this collection's records and the
+    /// backing <see cref="HnswIndex" /> graph to <paramref name="stream" />, serializing records with the
+    /// supplied source-generated <paramref name="context" />.
+    /// </summary>
+    /// <param name="stream">The destination stream.</param>
+    /// <param name="context">
+    /// A source-generated <see cref="JsonSerializerContext" /> that provides metadata for both
+    /// <typeparamref name="TKey" /> and <typeparamref name="TRecord" />.
+    /// </param>
+    public void Save(Stream stream, JsonSerializerContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        JsonTypeInfo keyInfo = ResolveTypeInfo(context, typeof(TKey));
+        JsonTypeInfo recordInfo = ResolveTypeInfo(context, typeof(TRecord));
+        SaveCore(
+            stream,
+            key => JsonSerializer.SerializeToUtf8Bytes(key, keyInfo),
+            record => JsonSerializer.SerializeToUtf8Bytes(record, recordInfo));
+    }
+
+    /// <summary>
+    /// Provider-specific persistence. Replaces this collection's contents with a snapshot
+    /// previously written by <see cref="Save(Stream)" />.
+    /// </summary>
+    /// <remarks>
+    /// This overload deserializes records by reflection. For trimmed or NativeAOT applications,
+    /// use <see cref="Load(Stream, JsonSerializerContext)" /> with a source-generated context.
+    /// </remarks>
+    [RequiresUnreferencedCode("Snapshot persistence serializes records by reflection and is incompatible with trimming. Use the JsonSerializerContext overload for trimming/NativeAOT.")]
+    [RequiresDynamicCode("Snapshot persistence serializes records by reflection and is incompatible with NativeAOT. Use the JsonSerializerContext overload for trimming/NativeAOT.")]
+    public void Load(Stream stream)
+        => LoadCore(stream, DeserializeByReflection<TKey>, DeserializeByReflection<TRecord>);
+
+    /// <summary>
+    /// Provider-specific persistence, AOT- and trimming-safe. Replaces this collection's contents with a
+    /// snapshot previously written by either <see cref="Save(Stream)" /> overload, deserializing records
+    /// with the supplied source-generated <paramref name="context" />.
+    /// </summary>
+    /// <param name="stream">The source stream.</param>
+    /// <param name="context">
+    /// A source-generated <see cref="JsonSerializerContext" /> that provides metadata for both
+    /// <typeparamref name="TKey" /> and <typeparamref name="TRecord" />.
+    /// </param>
+    public void Load(Stream stream, JsonSerializerContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        JsonTypeInfo keyInfo = ResolveTypeInfo(context, typeof(TKey));
+        JsonTypeInfo recordInfo = ResolveTypeInfo(context, typeof(TRecord));
+        LoadCore(
+            stream,
+            json => (TKey)JsonSerializer.Deserialize(json, keyInfo)!,
+            json => (TRecord)JsonSerializer.Deserialize(json, recordInfo)!);
+    }
+
+    // Shared binary framing for both the reflection and source-generated overloads. Records and keys are
+    // serialized individually so the caller's context only needs metadata for TKey and TRecord.
+    private void SaveCore(Stream stream, Func<TKey, byte[]> serializeKey, Func<TRecord, byte[]> serializeRecord)
     {
         ArgumentNullException.ThrowIfNull(stream);
 
         HnswCollectionData data = GetData();
         lock (data.Lock)
         {
-            var snapshot = new Snapshot { Dimension = data.Dimension, NextId = data.NextId };
-            foreach (KeyValuePair<object, HnswCollectionData.Entry> kvp in data.Records)
-            {
-                snapshot.Entries.Add(new SnapshotEntry { Key = (TKey)kvp.Key, Id = kvp.Value.Id, Record = (TRecord)kvp.Value.Record });
-            }
-
-            byte[] json = JsonSerializer.SerializeToUtf8Bytes(snapshot);
             using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
             {
                 writer.Write(SnapshotMagic);
                 writer.Write(SnapshotVersion);
-                writer.Write(json.Length);
-                writer.Write(json);
+                writer.Write(data.Dimension);
+                writer.Write(data.NextId);
+                writer.Write(data.Records.Count);
+                foreach (KeyValuePair<object, HnswCollectionData.Entry> kvp in data.Records)
+                {
+                    byte[] keyJson = serializeKey((TKey)kvp.Key);
+                    byte[] recordJson = serializeRecord((TRecord)kvp.Value.Record);
+                    writer.Write(kvp.Value.Id);
+                    writer.Write(keyJson.Length);
+                    writer.Write(keyJson);
+                    writer.Write(recordJson.Length);
+                    writer.Write(recordJson);
+                }
+
                 writer.Write(data.Index is not null);
             }
 
@@ -375,18 +444,14 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         }
     }
 
-    /// <summary>
-    /// Provider-specific persistence. Replaces this collection's contents with a snapshot
-    /// previously written by <see cref="Save" />.
-    /// </summary>
-    [RequiresUnreferencedCode("Snapshot persistence serializes records by reflection and is incompatible with trimming.")]
-    [RequiresDynamicCode("Snapshot persistence serializes records by reflection and is incompatible with NativeAOT.")]
-    public void Load(Stream stream)
+    private void LoadCore(Stream stream, Func<byte[], TKey> deserializeKey, Func<byte[], TRecord> deserializeRecord)
     {
         ArgumentNullException.ThrowIfNull(stream);
 
-        Snapshot snapshot;
+        int dimension;
+        long nextId;
         bool hasIndex;
+        var entries = new List<(TKey Key, long Id, TRecord Record)>();
         using (var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true))
         {
             if (reader.ReadUInt32() != SnapshotMagic)
@@ -399,46 +464,51 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                 throw new InvalidDataException("Unsupported Hnsw.Net collection snapshot version.");
             }
 
-            int length = reader.ReadInt32();
-            byte[] json = reader.ReadBytes(length);
+            dimension = reader.ReadInt32();
+            nextId = reader.ReadInt64();
+            int count = reader.ReadInt32();
+            for (int i = 0; i < count; i++)
+            {
+                long id = reader.ReadInt64();
+                byte[] keyJson = reader.ReadBytes(reader.ReadInt32());
+                byte[] recordJson = reader.ReadBytes(reader.ReadInt32());
+                entries.Add((deserializeKey(keyJson), id, deserializeRecord(recordJson)));
+            }
+
             hasIndex = reader.ReadBoolean();
-            snapshot = JsonSerializer.Deserialize<Snapshot>(json)
-                ?? throw new InvalidDataException("Invalid Hnsw.Net collection snapshot.");
         }
 
         HnswIndex? index = hasIndex ? HnswIndex.Load(stream) : null;
 
-        var data = new HnswCollectionData { Dimension = snapshot.Dimension, NextId = snapshot.NextId, Index = index };
-        foreach (SnapshotEntry entry in snapshot.Entries)
+        var data = new HnswCollectionData { Dimension = dimension, NextId = nextId, Index = index };
+        foreach ((TKey key, long id, TRecord record) in entries)
         {
-            ReadOnlyMemory<float> vector = index is not null && index.TryGetVector(entry.Id, out float[] v)
+            ReadOnlyMemory<float> vector = index is not null && index.TryGetVector(id, out float[] v)
                 ? v
                 : ReadOnlyMemory<float>.Empty;
-            data.Records[entry.Key!] = new HnswCollectionData.Entry { Record = entry.Record!, Id = entry.Id, Vector = vector };
-            data.IdToKey[entry.Id] = entry.Key!;
+            data.Records[key!] = new HnswCollectionData.Entry { Record = record!, Id = id, Vector = vector };
+            data.IdToKey[id] = key!;
         }
 
         _collections[Name] = data;
         _collectionTypes[Name] = typeof(TRecord);
     }
 
-    private sealed class Snapshot
-    {
-        public int Dimension { get; set; }
+    private static JsonTypeInfo ResolveTypeInfo(JsonSerializerContext context, Type type)
+        => context.GetTypeInfo(type) ?? throw new InvalidOperationException(
+            $"The supplied JsonSerializerContext does not provide metadata for type '{type}'. " +
+            $"Add [JsonSerializable(typeof({type.Name}))] to the context.");
 
-        public long NextId { get; set; }
+    [RequiresUnreferencedCode("Serializes by reflection.")]
+    [RequiresDynamicCode("Serializes by reflection.")]
+    private static byte[] SerializeByReflection<T>(T value)
+        => JsonSerializer.SerializeToUtf8Bytes(value);
 
-        public List<SnapshotEntry> Entries { get; set; } = new();
-    }
-
-    private sealed class SnapshotEntry
-    {
-        public TKey Key { get; set; } = default!;
-
-        public long Id { get; set; }
-
-        public TRecord Record { get; set; } = default!;
-    }
+    [RequiresUnreferencedCode("Deserializes by reflection.")]
+    [RequiresDynamicCode("Deserializes by reflection.")]
+    private static T DeserializeByReflection<T>(byte[] json)
+        => JsonSerializer.Deserialize<T>(json)
+            ?? throw new InvalidDataException("Invalid Hnsw.Net collection snapshot.");
 
     private HnswIndex GetOrCreateIndex(HnswCollectionData data, int dimension)
     {

@@ -96,6 +96,27 @@ var store = new HnswVectorStore(new HnswVectorStoreOptions { EmbeddingGenerator 
 The connector requires exactly one vector property; multiple vectors and dynamic
 (`Dictionary<string, object?>`) collections are not supported.
 
+To persist a collection, break glass to the concrete `HnswCollection<TKey, TRecord>`
+and call its provider-specific `Save`/`Load`. For trimmed or Native AOT applications,
+use the overloads that take a source-generated `JsonSerializerContext` so records
+serialize without runtime reflection:
+
+```csharp
+[JsonSerializable(typeof(Doc))]
+[JsonSerializable(typeof(int))]
+partial class StoreContext : JsonSerializerContext;
+
+var collection = (HnswCollection<int, Doc>)store.GetCollection<int, Doc>("docs");
+using (var stream = File.Create("docs.index"))
+{
+    collection.Save(stream, StoreContext.Default);
+}
+```
+
+The connector itself maps records by reflection, so consuming applications should
+preserve their record type's members under trimming (for example with an
+`ILLink.Descriptors.xml` entry).
+
 ## Scope
 
 This is a full port of the hnswlib runtime feature set (build, search, filtering,

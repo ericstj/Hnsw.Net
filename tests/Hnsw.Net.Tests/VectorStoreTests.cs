@@ -1,11 +1,12 @@
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.VectorData;
+using System.Text.Json.Serialization;
 using HnswNet;
 using Xunit;
 
 namespace Hnsw.Net.Tests;
 
-public class VectorStoreTests
+public partial class VectorStoreTests
 {
     private sealed class Doc
     {
@@ -140,6 +141,53 @@ public class VectorStoreTests
 
         Assert.Equal(3, results.Count);
         Assert.Equal(1, results[0].Record.Id);
+    }
+
+    [JsonSerializable(typeof(Doc))]
+    [JsonSerializable(typeof(int))]
+    private partial class SnapshotContext : JsonSerializerContext { }
+
+    [Fact]
+    public async Task SaveLoad_WithJsonContext_RoundTripsRecordsAndSearch()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+
+        using var ms = new MemoryStream();
+        collection.Save(ms, SnapshotContext.Default);
+        ms.Position = 0;
+
+        var reloaded = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        reloaded.Load(ms, SnapshotContext.Default);
+
+        Doc? fetched = await reloaded.GetAsync(2);
+        Assert.NotNull(fetched);
+        Assert.Equal("y axis", fetched!.Text);
+
+        List<VectorSearchResult<Doc>> results = new();
+        await foreach (VectorSearchResult<Doc> r in reloaded.SearchAsync(new float[] { 0.9f, 0.1f, 0f }, top: 3))
+        {
+            results.Add(r);
+        }
+
+        Assert.Equal(3, results.Count);
+        Assert.Equal(1, results[0].Record.Id);
+    }
+
+    [Fact]
+    public async Task Save_WithJsonContext_LoadableByReflection()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+
+        using var ms = new MemoryStream();
+        collection.Save(ms, SnapshotContext.Default);
+        ms.Position = 0;
+
+        var reloaded = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        reloaded.Load(ms);
+
+        Doc? fetched = await reloaded.GetAsync(3);
+        Assert.NotNull(fetched);
+        Assert.Equal("z axis", fetched!.Text);
     }
 
     private sealed class StringDoc
