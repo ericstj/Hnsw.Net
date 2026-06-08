@@ -5,6 +5,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageVersion Include="Microsoft.Extensions.AI.Abstractions" Version="10.6.0" />
+    <PackageVersion Include="Microsoft.Extensions.VectorData.Abstractions" Version="10.6.0" />
     <PackageVersion Include="System.Numerics.Tensors" Version="10.0.8" />
   </ItemGroup>
 

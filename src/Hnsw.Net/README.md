@@ -54,6 +54,48 @@ vectors are normalized on add and on query. Duplicate ids throw `ArgumentExcepti
 Searches are thread-safe and may run concurrently; build and modification are
 single-writer.
 
+## Microsoft.Extensions.VectorData
+
+Hnsw.Net ships an in-box [Microsoft.Extensions.VectorData](https://learn.microsoft.com/dotnet/ai/microsoft-extensions-vector-data)
+(MEVD) connector, so you can use the same `VectorStore` / `VectorStoreCollection`
+abstractions as other .NET vector databases — backed entirely in-process with no
+external service.
+
+```csharp
+using HnswNet;
+using Microsoft.Extensions.VectorData;
+
+public sealed class Doc
+{
+    [VectorStoreKey] public int Id { get; set; }
+    [VectorStoreData] public string Text { get; set; } = "";
+    [VectorStoreVector(3, DistanceFunction = DistanceFunction.CosineSimilarity)]
+    public ReadOnlyMemory<float> Vector { get; set; }
+}
+
+var store = new HnswVectorStore();
+var collection = store.GetCollection<int, Doc>("docs");
+await collection.EnsureCollectionExistsAsync();
+
+await collection.UpsertAsync(new Doc { Id = 1, Text = "x axis", Vector = new[] { 1f, 0f, 0f } });
+
+await foreach (var result in collection.SearchAsync(new[] { 0.9f, 0.1f, 0f }, top: 3))
+{
+    Console.WriteLine($"{result.Record.Text}: {result.Score}");
+}
+```
+
+Pass a [`Microsoft.Extensions.AI`](https://learn.microsoft.com/dotnet/ai/microsoft-extensions-ai)
+`IEmbeddingGenerator` (such as `Model2Vec.Net`) to embed records and queries from
+text automatically:
+
+```csharp
+var store = new HnswVectorStore(new HnswVectorStoreOptions { EmbeddingGenerator = embeddingGenerator });
+```
+
+The connector requires exactly one vector property; multiple vectors and dynamic
+(`Dictionary<string, object?>`) collections are not supported.
+
 ## Scope
 
 This is a full port of the hnswlib runtime feature set (build, search, filtering,
