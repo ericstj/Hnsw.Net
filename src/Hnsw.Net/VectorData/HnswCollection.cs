@@ -514,9 +514,21 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             data.Index = index;
             foreach ((TKey key, long id, TRecord record) in entries)
             {
-                ReadOnlyMemory<float> vector = index is not null && index.TryGetVector(id, out float[] v)
-                    ? v
-                    : ReadOnlyMemory<float>.Empty;
+                ReadOnlyMemory<float> vector;
+                if (index is null)
+                {
+                    vector = ReadOnlyMemory<float>.Empty;
+                }
+                else if (index.TryGetVector(id, out float[] v))
+                {
+                    vector = v;
+                }
+                else
+                {
+                    throw new InvalidDataException(
+                        $"Corrupt Hnsw.Net collection snapshot: the index does not contain a vector for record id {id}.");
+                }
+
                 data.Records[key!] = new HnswCollectionData.Entry { Record = record!, Id = id, Vector = vector };
                 data.IdToKey[id] = key!;
             }
@@ -532,6 +544,14 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative payload length.");
         }
 
+        // Guard against a bogus length prefix triggering a huge up-front allocation: when the stream is
+        // seekable, the payload cannot be larger than the bytes that remain.
+        Stream baseStream = reader.BaseStream;
+        if (baseStream.CanSeek && length > baseStream.Length - baseStream.Position)
+        {
+            throw new InvalidDataException("Truncated Hnsw.Net collection snapshot.");
+        }
+
         byte[] payload = reader.ReadBytes(length);
         if (payload.Length != length)
         {
@@ -544,7 +564,7 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
     private static JsonTypeInfo ResolveTypeInfo(JsonSerializerContext context, Type type)
         => context.GetTypeInfo(type) ?? throw new InvalidOperationException(
             $"The supplied JsonSerializerContext does not provide metadata for type '{type}'. " +
-            $"Add [JsonSerializable(typeof({type.Name}))] to the context.");
+            $"Add a [JsonSerializable] attribute for it to the context.");
 
     [RequiresUnreferencedCode("Serializes by reflection.")]
     [RequiresDynamicCode("Serializes by reflection.")]

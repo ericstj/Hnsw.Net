@@ -104,7 +104,7 @@ serialize without runtime reflection:
 ```csharp
 [JsonSerializable(typeof(Doc))]
 [JsonSerializable(typeof(int))]
-partial class StoreContext : JsonSerializerContext;
+partial class StoreContext : JsonSerializerContext { }
 
 var collection = (HnswCollection<int, Doc>)store.GetCollection<int, Doc>("docs");
 using (var stream = File.Create("docs.index"))
