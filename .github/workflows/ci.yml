@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "arg=-p:Version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "arg=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore
+        run: dotnet restore Hnsw.Net.sln
+
+      - name: Build
+        run: dotnet build Hnsw.Net.sln -c Release --no-restore ${{ steps.ver.outputs.arg }}
+
+      - name: Test
+        run: dotnet test Hnsw.Net.sln -c Release --no-build --verbosity normal
+
+      - name: Pack
+        run: dotnet pack src/Hnsw.Net/Hnsw.Net.csproj -c Release --no-build -o artifacts ${{ steps.ver.outputs.arg }}
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: nupkg
+          path: artifacts/*
+
+      - name: Publish to NuGet.org
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: >
+          dotnet nuget push "artifacts/*.nupkg"
+          --api-key "${{ secrets.NUGET_API_KEY }}"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
