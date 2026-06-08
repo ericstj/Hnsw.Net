@@ -18,9 +18,9 @@
 
   <PropertyGroup Label="Packaging">
     <PackageId>Hnsw.Net</PackageId>
-    <Version>0.1.1</Version>
+    <Version>0.1.2</Version>
     <EnablePackageValidation>true</EnablePackageValidation>
-    <PackageValidationBaselineVersion>0.1.0</PackageValidationBaselineVersion>
+    <PackageValidationBaselineVersion>0.1.1</PackageValidationBaselineVersion>
     <Authors>ericstj</Authors>
     <Description>Pure managed HNSW approximate-nearest-neighbor search for .NET with SIMD-accelerated vector distances and no native dependency.</Description>
     <PackageTags>hnsw;ann;nearest-neighbor;vector-search;similarity-search;machine-learning</PackageTags>
