@@ -4,8 +4,10 @@ A pure C# (`net10.0`), **no native dependency** implementation of HNSW
 (Hierarchical Navigable Small World graphs) for approximate nearest-neighbor
 search over `float` vectors.
 
-See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for attribution to the
-HNSW paper and hnswlib.
+Implemented from the published HNSW algorithm
+([Malkov & Yashunin](https://arxiv.org/abs/1603.09320)); behavior is validated
+against the reference [hnswlib](https://github.com/nmslib/hnswlib). See
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for full attribution.
 
 ## Features
 
