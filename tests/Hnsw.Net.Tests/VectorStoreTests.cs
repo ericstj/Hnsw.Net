@@ -116,6 +116,32 @@ public class VectorStoreTests
         Assert.Contains(results, r => r.Record.Id == 1);
     }
 
+    [Fact]
+    public async Task SaveLoad_RoundTripsRecordsAndSearch()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+
+        using var ms = new MemoryStream();
+        collection.Save(ms);
+        ms.Position = 0;
+
+        var reloaded = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        reloaded.Load(ms);
+
+        Doc? fetched = await reloaded.GetAsync(2);
+        Assert.NotNull(fetched);
+        Assert.Equal("y axis", fetched!.Text);
+
+        List<VectorSearchResult<Doc>> results = new();
+        await foreach (VectorSearchResult<Doc> r in reloaded.SearchAsync(new float[] { 0.9f, 0.1f, 0f }, top: 3))
+        {
+            results.Add(r);
+        }
+
+        Assert.Equal(3, results.Count);
+        Assert.Equal(1, results[0].Record.Id);
+    }
+
     private sealed class StringDoc
     {
         [VectorStoreKey]

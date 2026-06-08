@@ -2,6 +2,8 @@ using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.VectorData;
 using Microsoft.Extensions.VectorData.ProviderServices;
@@ -331,6 +333,111 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             serviceType == typeof(VectorStoreCollectionMetadata) ? _metadata :
             serviceType.IsInstanceOfType(this) ? this :
             null;
+    }
+
+    private const uint SnapshotMagic = 0x44564E48; // "HNVD"
+    private const int SnapshotVersion = 1;
+
+    /// <summary>
+    /// Provider-specific persistence. Writes this collection's records and the backing
+    /// <see cref="HnswIndex" /> graph to <paramref name="stream" /> in a self-contained format.
+    /// </summary>
+    /// <remarks>
+    /// This is not part of the <see cref="VectorStoreCollection{TKey, TRecord}" /> abstraction;
+    /// reach it by holding the concrete <see cref="HnswCollection{TKey, TRecord}" /> type.
+    /// </remarks>
+    [RequiresUnreferencedCode("Snapshot persistence serializes records by reflection and is incompatible with trimming.")]
+    [RequiresDynamicCode("Snapshot persistence serializes records by reflection and is incompatible with NativeAOT.")]
+    public void Save(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+
+        HnswCollectionData data = GetData();
+        lock (data.Lock)
+        {
+            var snapshot = new Snapshot { Dimension = data.Dimension, NextId = data.NextId };
+            foreach (KeyValuePair<object, HnswCollectionData.Entry> kvp in data.Records)
+            {
+                snapshot.Entries.Add(new SnapshotEntry { Key = (TKey)kvp.Key, Id = kvp.Value.Id, Record = (TRecord)kvp.Value.Record });
+            }
+
+            byte[] json = JsonSerializer.SerializeToUtf8Bytes(snapshot);
+            using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
+            {
+                writer.Write(SnapshotMagic);
+                writer.Write(SnapshotVersion);
+                writer.Write(json.Length);
+                writer.Write(json);
+                writer.Write(data.Index is not null);
+            }
+
+            data.Index?.Save(stream);
+        }
+    }
+
+    /// <summary>
+    /// Provider-specific persistence. Replaces this collection's contents with a snapshot
+    /// previously written by <see cref="Save" />.
+    /// </summary>
+    [RequiresUnreferencedCode("Snapshot persistence serializes records by reflection and is incompatible with trimming.")]
+    [RequiresDynamicCode("Snapshot persistence serializes records by reflection and is incompatible with NativeAOT.")]
+    public void Load(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+
+        Snapshot snapshot;
+        bool hasIndex;
+        using (var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true))
+        {
+            if (reader.ReadUInt32() != SnapshotMagic)
+            {
+                throw new InvalidDataException("The stream is not an Hnsw.Net collection snapshot.");
+            }
+
+            if (reader.ReadInt32() != SnapshotVersion)
+            {
+                throw new InvalidDataException("Unsupported Hnsw.Net collection snapshot version.");
+            }
+
+            int length = reader.ReadInt32();
+            byte[] json = reader.ReadBytes(length);
+            hasIndex = reader.ReadBoolean();
+            snapshot = JsonSerializer.Deserialize<Snapshot>(json)
+                ?? throw new InvalidDataException("Invalid Hnsw.Net collection snapshot.");
+        }
+
+        HnswIndex? index = hasIndex ? HnswIndex.Load(stream) : null;
+
+        var data = new HnswCollectionData { Dimension = snapshot.Dimension, NextId = snapshot.NextId, Index = index };
+        foreach (SnapshotEntry entry in snapshot.Entries)
+        {
+            ReadOnlyMemory<float> vector = index is not null && index.TryGetVector(entry.Id, out float[] v)
+                ? v
+                : ReadOnlyMemory<float>.Empty;
+            data.Records[entry.Key!] = new HnswCollectionData.Entry { Record = entry.Record!, Id = entry.Id, Vector = vector };
+            data.IdToKey[entry.Id] = entry.Key!;
+        }
+
+        _collections[Name] = data;
+        _collectionTypes[Name] = typeof(TRecord);
+    }
+
+    private sealed class Snapshot
+    {
+        public int Dimension { get; set; }
+
+        public long NextId { get; set; }
+
+        public List<SnapshotEntry> Entries { get; set; } = new();
+    }
+
+    private sealed class SnapshotEntry
+    {
+        public TKey Key { get; set; } = default!;
+
+        public long Id { get; set; }
+
+        public TRecord Record { get; set; } = default!;
     }
 
     private HnswIndex GetOrCreateIndex(HnswCollectionData data, int dimension)
