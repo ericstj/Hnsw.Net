@@ -26,6 +26,9 @@ against the reference [hnswlib](https://github.com/nmslib/hnswlib). See
 - Versioned binary save/load round-trips indexes (including deleted state)
   without native dependencies.
 - Portable export/rebuild bridge for stored ids and vectors.
+- In-box `Microsoft.Extensions.VectorData` connector (`HnswVectorStore` /
+  `HnswCollection<TKey, TRecord>`) for the standard .NET vector-store abstractions,
+  with optional `Microsoft.Extensions.AI` embedding generation.
 - Behavioral parity validation against a committed Python hnswlib oracle.
 
 ## Usage
