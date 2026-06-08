@@ -1,35 +1,33 @@
-using System.Collections.ObjectModel;
+using System.Collections.Concurrent;
 using System.Numerics;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace HnswNet;
 
 /// <summary>
-/// A single-threaded HNSW approximate-nearest-neighbor index over <see cref="float" /> vectors.
+/// An HNSW approximate-nearest-neighbor index over <see cref="float" /> vectors.
+/// Builds and modifications are serialized; searches are thread-safe and may run concurrently.
 /// </summary>
 public sealed class HnswIndex
 {
-    private const int FormatVersion = 2;
+    private const int FormatVersion = 3;
     private const uint Magic = 0x31575348; // HSW1, little-endian.
 
     private readonly List<Node> _nodes = new();
     private readonly Dictionary<long, int> _ids = new();
     private readonly Random _random;
     private readonly double _levelMultiplier;
+    private readonly bool _allowReplaceDeleted;
+    private readonly Stack<int> _deletedSlots = new();
+    private int _deletedCount;
     private int _entryPoint = -1;
     private int _maxLevel = -1;
 
-    private int[] _visitedStamp = Array.Empty<int>();
-    private int _visitedVersion;
-    private readonly PriorityQueue<Candidate, float> _candidatesQueue = new();
-    private readonly PriorityQueue<Candidate, float> _nearestQueue = new();
-    private readonly List<Candidate> _layerResult = new();
-    private readonly List<Candidate> _pruneCandidates = new();
-    private readonly List<Candidate> _selectPruned = new();
-    private readonly List<int> _addSelected = new();
-    private readonly List<int> _pruneSelected = new();
+    private readonly ReaderWriterLockSlim _lock = new();
+    private readonly ConcurrentBag<Scratch> _scratchPool = new();
     private readonly Comparison<Candidate> _candidateComparison;
     private float[] _storedVectors = Array.Empty<float>();
 
@@ -39,7 +37,8 @@ public sealed class HnswIndex
     /// <param name="m">Maximum number of connections per non-zero layer. Layer 0 uses <c>2 * m</c>.</param>
     /// <param name="efConstruction">Beam width used while adding vectors.</param>
     /// <param name="seed">Optional random seed for reproducible layer assignment.</param>
-    public HnswIndex(int dimension, DistanceMetric metric, int m = 16, int efConstruction = 200, int? seed = null)
+    /// <param name="allowReplaceDeleted">When true, <see cref="Add(long, ReadOnlySpan{float})" /> reuses slots freed by <see cref="MarkDeleted" />.</param>
+    public HnswIndex(int dimension, DistanceMetric metric, int m = 16, int efConstruction = 200, int? seed = null, bool allowReplaceDeleted = false)
     {
         if (dimension <= 0)
         {
@@ -61,10 +60,11 @@ public sealed class HnswIndex
         Ef = 50;
         _random = seed.HasValue ? new Random(seed.Value) : new Random();
         _levelMultiplier = 1.0 / Math.Log(m);
+        _allowReplaceDeleted = allowReplaceDeleted;
         _candidateComparison = CompareCandidates;
     }
 
-    private HnswIndex(int dimension, DistanceMetric metric, int m, int efConstruction, int ef, int entryPoint, int maxLevel)
+    private HnswIndex(int dimension, DistanceMetric metric, int m, int efConstruction, int ef, int entryPoint, int maxLevel, bool allowReplaceDeleted)
     {
         Dimension = dimension;
         Metric = metric;
@@ -75,6 +75,7 @@ public sealed class HnswIndex
         _maxLevel = maxLevel;
         _random = new Random(0);
         _levelMultiplier = 1.0 / Math.Log(m);
+        _allowReplaceDeleted = allowReplaceDeleted;
         _candidateComparison = CompareCandidates;
     }
 
@@ -93,17 +94,49 @@ public sealed class HnswIndex
     /// <summary>Gets or sets the search beam width.</summary>
     public int Ef { get; set; }
 
-    /// <summary>Gets the number of indexed vectors.</summary>
-    public int Count => _nodes.Count;
+    /// <summary>Gets the number of allocated slots, including those freed by <see cref="MarkDeleted" />.</summary>
+    public int Count
+    {
+        get { _lock.EnterReadLock(); try { return _nodes.Count; } finally { _lock.ExitReadLock(); } }
+    }
+
+    /// <summary>Gets the number of slots currently marked deleted.</summary>
+    public int DeletedCount
+    {
+        get { _lock.EnterReadLock(); try { return _deletedCount; } finally { _lock.ExitReadLock(); } }
+    }
+
+    /// <summary>Gets the number of live (non-deleted) vectors returnable from a search.</summary>
+    public int ActiveCount
+    {
+        get { _lock.EnterReadLock(); try { return _nodes.Count - _deletedCount; } finally { _lock.ExitReadLock(); } }
+    }
+
+    /// <summary>Gets whether <see cref="Add(long, ReadOnlySpan{float})" /> reuses slots freed by <see cref="MarkDeleted" />.</summary>
+    public bool AllowReplaceDeleted => _allowReplaceDeleted;
 
     /// <summary>
-    /// Returns copies of the indexed ids and original vectors, suitable for rebuilding a portable index.
+    /// Returns copies of the live ids and original vectors, suitable for rebuilding a portable index.
     /// </summary>
     public IEnumerable<(long Id, float[] Vector)> ExportItems()
     {
-        foreach (Node node in _nodes)
+        _lock.EnterReadLock();
+        try
         {
-            yield return (node.Id, (float[])node.OriginalVector.Clone());
+            var items = new List<(long, float[])>(_nodes.Count - _deletedCount);
+            foreach (Node node in _nodes)
+            {
+                if (!node.Deleted)
+                {
+                    items.Add((node.Id, (float[])node.OriginalVector.Clone()));
+                }
+            }
+
+            return items;
+        }
+        finally
+        {
+            _lock.ExitReadLock();
         }
     }
 
@@ -115,10 +148,11 @@ public sealed class HnswIndex
         int m = 16,
         int efConstruction = 200,
         int ef = 50,
-        int? seed = null)
+        int? seed = null,
+        bool allowReplaceDeleted = false)
     {
         ArgumentNullException.ThrowIfNull(items);
-        var index = new HnswIndex(dimension, metric, m, efConstruction, seed)
+        var index = new HnswIndex(dimension, metric, m, efConstruction, seed, allowReplaceDeleted)
         {
             Ef = ef,
         };
@@ -132,35 +166,168 @@ public sealed class HnswIndex
         return index;
     }
 
-    /// <summary>Adds a vector with the specified id. Duplicate ids throw <see cref="ArgumentException" />.</summary>
+    /// <summary>
+    /// Adds a vector with the specified id. Duplicate ids throw <see cref="ArgumentException" />. When
+    /// <see cref="AllowReplaceDeleted" /> is set, a slot previously freed by <see cref="MarkDeleted" /> is reused.
+    /// </summary>
     public void Add(long id, ReadOnlySpan<float> vector)
     {
         ValidateVector(vector);
-        if (_ids.ContainsKey(id))
-        {
-            throw new ArgumentException("An item with the same id already exists.", nameof(id));
-        }
-
         float[] originalVector = vector.ToArray();
-        int level = RandomLevel();
-        int newIndex = _nodes.Count;
-        EnsureStoredCapacity(newIndex + 1);
-        PrepareVectorInto(vector, StoredSpanMutable(newIndex));
-        var node = new Node(id, originalVector, level);
-        _nodes.Add(node);
-        _ids.Add(id, newIndex);
-        if (_visitedStamp.Length < _nodes.Count)
+        _lock.EnterWriteLock();
+        try
         {
-            Array.Resize(ref _visitedStamp, Math.Max(16, _nodes.Count * 2));
-        }
+            if (_ids.ContainsKey(id))
+            {
+                throw new ArgumentException("An item with the same id already exists.", nameof(id));
+            }
 
-        if (_entryPoint < 0)
+            while (_allowReplaceDeleted && _deletedSlots.Count > 0)
+            {
+                int slot = _deletedSlots.Pop();
+                if (_nodes[slot].Deleted && slot != _entryPoint)
+                {
+                    ReplaceSlot(slot, id, originalVector, originalVector);
+                    return;
+                }
+            }
+
+            int level = RandomLevel();
+            int newIndex = _nodes.Count;
+            EnsureStoredCapacity(newIndex + 1);
+            PrepareVectorInto(originalVector, StoredSpanMutable(newIndex));
+            var node = new Node(id, originalVector, level);
+            _nodes.Add(node);
+            _ids.Add(id, newIndex);
+
+            if (_entryPoint < 0)
+            {
+                _entryPoint = newIndex;
+                _maxLevel = level;
+                return;
+            }
+
+            Scratch s = RentScratch();
+            try
+            {
+                LinkNode(newIndex, level, s);
+            }
+            finally
+            {
+                ReturnScratch(s);
+            }
+
+            if (level > _maxLevel)
+            {
+                _entryPoint = newIndex;
+                _maxLevel = level;
+            }
+        }
+        finally
         {
-            _entryPoint = newIndex;
-            _maxLevel = level;
-            return;
+            _lock.ExitWriteLock();
         }
+    }
 
+    /// <summary>Adds a vector with the specified id.</summary>
+    public void Add(long id, ReadOnlyMemory<float> vector) => Add(id, vector.Span);
+
+    /// <summary>
+    /// Marks the vector with the specified id deleted. Deleted vectors stay in the graph for connectivity but are
+    /// never returned from a search. Throws <see cref="KeyNotFoundException" /> if the id is unknown.
+    /// </summary>
+    public void MarkDeleted(long id)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            if (!_ids.TryGetValue(id, out int slot))
+            {
+                throw new KeyNotFoundException($"No item with id {id} exists.");
+            }
+
+            Node node = _nodes[slot];
+            if (node.Deleted)
+            {
+                return;
+            }
+
+            node.Deleted = true;
+            _deletedCount++;
+            if (_allowReplaceDeleted && slot != _entryPoint)
+            {
+                _deletedSlots.Push(slot);
+            }
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>Restores a vector previously marked by <see cref="MarkDeleted" />, making it searchable again.</summary>
+    public void UnmarkDeleted(long id)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            if (!_ids.TryGetValue(id, out int slot))
+            {
+                throw new KeyNotFoundException($"No item with id {id} exists.");
+            }
+
+            Node node = _nodes[slot];
+            if (!node.Deleted)
+            {
+                return;
+            }
+
+            node.Deleted = false;
+            _deletedCount--;
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>Returns whether a live (non-deleted) vector with the specified id exists.</summary>
+    public bool Contains(long id)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            return _ids.TryGetValue(id, out int slot) && !_nodes[slot].Deleted;
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+    }
+
+    /// <summary>Gets a copy of the original vector for a live id. Returns false for unknown or deleted ids.</summary>
+    public bool TryGetVector(long id, out float[] vector)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            if (_ids.TryGetValue(id, out int slot) && !_nodes[slot].Deleted)
+            {
+                vector = (float[])_nodes[slot].OriginalVector.Clone();
+                return true;
+            }
+
+            vector = Array.Empty<float>();
+            return false;
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+    }
+
+    private void LinkNode(int newIndex, int level, Scratch s)
+    {
         int entryPoint = _entryPoint;
         float entryDistance = Distance(StoredSpan(newIndex), StoredSpan(entryPoint));
 
@@ -169,112 +336,188 @@ public sealed class HnswIndex
             (entryPoint, entryDistance) = SearchGreedy(StoredSpan(newIndex), entryPoint, entryDistance, layer);
         }
 
+        Node node = _nodes[newIndex];
         int topLayer = Math.Min(level, _maxLevel);
         for (int layer = topLayer; layer >= 0; layer--)
         {
-            SearchLayer(StoredSpan(newIndex), entryPoint, EfConstruction, layer);
-            SelectNeighbors(_layerResult, MaxConnections(layer), _addSelected);
-            foreach (int neighbor in _addSelected)
+            SearchLayer(StoredSpan(newIndex), entryPoint, EfConstruction, layer, s, null);
+            SelectNeighbors(s.LayerResult, MaxConnections(layer), s.AddSelected, s);
+            foreach (int neighbor in s.AddSelected)
             {
+                if (neighbor == newIndex)
+                {
+                    continue;
+                }
+
                 node.Links[layer].Add(neighbor);
                 List<int> links = _nodes[neighbor].Links[layer];
                 if (!links.Contains(newIndex))
                 {
                     links.Add(newIndex);
                 }
-                PruneConnections(neighbor, layer);
+                PruneConnections(neighbor, layer, s);
             }
 
-            if (_layerResult.Count > 0)
+            if (s.LayerResult.Count > 0)
             {
-                Candidate nearest = _layerResult[0];
+                Candidate nearest = s.LayerResult[0];
                 entryPoint = nearest.Index;
                 entryDistance = nearest.Distance;
             }
         }
-
-        if (level > _maxLevel)
-        {
-            _entryPoint = newIndex;
-            _maxLevel = level;
-        }
     }
 
-    /// <summary>Adds a vector with the specified id.</summary>
-    public void Add(long id, ReadOnlyMemory<float> vector) => Add(id, vector.Span);
+    private void ReplaceSlot(int slot, long id, ReadOnlySpan<float> vector, float[] originalVector)
+    {
+        Node node = _nodes[slot];
+        for (int layer = 0; layer < node.Links.Length; layer++)
+        {
+            foreach (int neighbor in node.Links[layer])
+            {
+                _nodes[neighbor].Links[layer].Remove(slot);
+            }
+
+            node.Links[layer].Clear();
+        }
+
+        _ids.Remove(node.Id);
+        node.Id = id;
+        node.OriginalVector = originalVector;
+        node.Deleted = false;
+        _deletedCount--;
+        _ids.Add(id, slot);
+        PrepareVectorInto(vector, StoredSpanMutable(slot));
+
+        Scratch s = RentScratch();
+        try
+        {
+            LinkNode(slot, node.Level, s);
+        }
+        finally
+        {
+            ReturnScratch(s);
+        }
+    }
 
     /// <summary>
     /// Searches for the nearest vectors. Results are sorted by ascending distance; for dot product this means most similar first.
     /// </summary>
-    public IReadOnlyList<(long Id, float Distance)> Search(ReadOnlySpan<float> query, int k)
+    public IReadOnlyList<(long Id, float Distance)> Search(ReadOnlySpan<float> query, int k) => Search(query, k, null);
+
+    /// <summary>
+    /// Searches for the nearest vectors, optionally restricted to ids accepted by <paramref name="filter" />.
+    /// Deleted vectors are always excluded. The call is thread-safe with respect to concurrent searches.
+    /// </summary>
+    public IReadOnlyList<(long Id, float Distance)> Search(ReadOnlySpan<float> query, int k, Func<long, bool>? filter)
     {
         ValidateVector(query);
-        if (k <= 0 || _entryPoint < 0)
+        if (k <= 0)
         {
             return Array.Empty<(long Id, float Distance)>();
         }
 
         float[] preparedQuery = PrepareVector(query);
-        int entryPoint = _entryPoint;
-        float entryDistance = Distance(preparedQuery, StoredSpan(entryPoint));
-        for (int layer = _maxLevel; layer > 0; layer--)
+        _lock.EnterReadLock();
+        try
         {
-            (entryPoint, entryDistance) = SearchGreedy(preparedQuery, entryPoint, entryDistance, layer);
-        }
+            if (_entryPoint < 0)
+            {
+                return Array.Empty<(long Id, float Distance)>();
+            }
 
-        int ef = Math.Max(Ef, k);
-        SearchLayer(preparedQuery, entryPoint, ef, 0);
-        int resultCount = Math.Min(k, _layerResult.Count);
-        var results = new (long Id, float Distance)[resultCount];
-        for (int i = 0; i < resultCount; i++)
+            Func<int, bool>? allowed = null;
+            if (filter is not null)
+            {
+                allowed = i => !_nodes[i].Deleted && filter(_nodes[i].Id);
+            }
+            else if (_deletedCount > 0)
+            {
+                allowed = i => !_nodes[i].Deleted;
+            }
+
+            Scratch s = RentScratch();
+            try
+            {
+                int entryPoint = _entryPoint;
+                float entryDistance = Distance(preparedQuery, StoredSpan(entryPoint));
+                for (int layer = _maxLevel; layer > 0; layer--)
+                {
+                    (entryPoint, entryDistance) = SearchGreedy(preparedQuery, entryPoint, entryDistance, layer);
+                }
+
+                int ef = Math.Max(Ef, k);
+                SearchLayer(preparedQuery, entryPoint, ef, 0, s, allowed);
+                int resultCount = Math.Min(k, s.LayerResult.Count);
+                var results = new (long Id, float Distance)[resultCount];
+                for (int i = 0; i < resultCount; i++)
+                {
+                    Candidate candidate = s.LayerResult[i];
+                    results[i] = (_nodes[candidate.Index].Id, candidate.Distance);
+                }
+
+                return results;
+            }
+            finally
+            {
+                ReturnScratch(s);
+            }
+        }
+        finally
         {
-            Candidate candidate = _layerResult[i];
-            results[i] = (_nodes[candidate.Index].Id, candidate.Distance);
+            _lock.ExitReadLock();
         }
-
-        return results;
     }
 
     /// <summary>Saves the index to a stream using a versioned binary format.</summary>
     public void Save(Stream stream)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        using var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true);
-        writer.Write(Magic);
-        writer.Write(FormatVersion);
-        writer.Write(Dimension);
-        writer.Write((int)Metric);
-        writer.Write(M);
-        writer.Write(EfConstruction);
-        writer.Write(Ef);
-        writer.Write(_entryPoint);
-        writer.Write(_maxLevel);
-        writer.Write(_nodes.Count);
-
-        for (int n = 0; n < _nodes.Count; n++)
+        _lock.EnterReadLock();
+        try
         {
-            Node node = _nodes[n];
-            writer.Write(node.Id);
-            writer.Write(node.Level);
-            ReadOnlySpan<float> stored = StoredSpan(n);
-            for (int i = 0; i < Dimension; i++)
-            {
-                writer.Write(stored[i]);
-            }
-            for (int i = 0; i < Dimension; i++)
-            {
-                writer.Write(node.OriginalVector[i]);
-            }
+            using var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true);
+            writer.Write(Magic);
+            writer.Write(FormatVersion);
+            writer.Write(Dimension);
+            writer.Write((int)Metric);
+            writer.Write(M);
+            writer.Write(EfConstruction);
+            writer.Write(Ef);
+            writer.Write(_entryPoint);
+            writer.Write(_maxLevel);
+            writer.Write(_nodes.Count);
+            writer.Write(_allowReplaceDeleted);
 
-            writer.Write(node.Links.Length);
-            for (int layer = 0; layer < node.Links.Length; layer++)
+            for (int n = 0; n < _nodes.Count; n++)
             {
-                writer.Write(node.Links[layer].Count);
-                foreach (int neighbor in node.Links[layer])
+                Node node = _nodes[n];
+                writer.Write(node.Id);
+                writer.Write(node.Level);
+                writer.Write(node.Deleted);
+                ReadOnlySpan<float> stored = StoredSpan(n);
+                for (int i = 0; i < Dimension; i++)
                 {
-                    writer.Write(neighbor);
+                    writer.Write(stored[i]);
+                }
+                for (int i = 0; i < Dimension; i++)
+                {
+                    writer.Write(node.OriginalVector[i]);
+                }
+
+                writer.Write(node.Links.Length);
+                for (int layer = 0; layer < node.Links.Length; layer++)
+                {
+                    writer.Write(node.Links[layer].Count);
+                    foreach (int neighbor in node.Links[layer])
+                    {
+                        writer.Write(neighbor);
+                    }
                 }
             }
+        }
+        finally
+        {
+            _lock.ExitReadLock();
         }
     }
 
@@ -301,13 +544,15 @@ public sealed class HnswIndex
         int entryPoint = reader.ReadInt32();
         int maxLevel = reader.ReadInt32();
         int count = reader.ReadInt32();
-        var index = new HnswIndex(dimension, metric, m, efConstruction, ef, entryPoint, maxLevel);
+        bool allowReplaceDeleted = version >= 3 && reader.ReadBoolean();
+        var index = new HnswIndex(dimension, metric, m, efConstruction, ef, entryPoint, maxLevel, allowReplaceDeleted);
         index._storedVectors = count > 0 ? new float[count * dimension] : Array.Empty<float>();
 
         for (int i = 0; i < count; i++)
         {
             long id = reader.ReadInt64();
             int level = reader.ReadInt32();
+            bool deleted = version >= 3 && reader.ReadBoolean();
             Span<float> stored = index._storedVectors.AsSpan(i * dimension, dimension);
             for (int j = 0; j < dimension; j++)
             {
@@ -326,7 +571,7 @@ public sealed class HnswIndex
                 stored.CopyTo(originalVector);
             }
 
-            var node = new Node(id, originalVector, level);
+            var node = new Node(id, originalVector, level) { Deleted = deleted };
             int layerCount = reader.ReadInt32();
             if (layerCount != level + 1)
             {
@@ -344,9 +589,16 @@ public sealed class HnswIndex
 
             index._ids.Add(id, i);
             index._nodes.Add(node);
+            if (deleted)
+            {
+                index._deletedCount++;
+                if (allowReplaceDeleted && i != entryPoint)
+                {
+                    index._deletedSlots.Push(i);
+                }
+            }
         }
 
-        index._visitedStamp = count > 0 ? new int[count] : Array.Empty<int>();
         return index;
     }
 
@@ -403,17 +655,6 @@ public sealed class HnswIndex
         Array.Resize(ref _storedVectors, capacity);
     }
 
-    private int NextVisitedVersion()
-    {
-        if (++_visitedVersion == 0)
-        {
-            Array.Clear(_visitedStamp);
-            _visitedVersion = 1;
-        }
-
-        return _visitedVersion;
-    }
-
     private ReadOnlySpan<float> StoredSpan(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
 
     private Span<float> StoredSpanMutable(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
@@ -446,22 +687,30 @@ public sealed class HnswIndex
         return (entryPoint, entryDistance);
     }
 
-    private void SearchLayer(ReadOnlySpan<float> query, int entryPoint, int ef, int layer)
+    private void SearchLayer(ReadOnlySpan<float> query, int entryPoint, int ef, int layer, Scratch s, Func<int, bool>? allowed)
     {
-        int version = NextVisitedVersion();
-        _candidatesQueue.Clear();
-        _nearestQueue.Clear();
-        _visitedStamp[entryPoint] = version;
+        int version = s.NextVersion(_nodes.Count);
+        s.Candidates.Clear();
+        s.Nearest.Clear();
+        s.Visited[entryPoint] = version;
 
         float entryDistance = Distance(query, StoredSpan(entryPoint));
         var entry = new Candidate(entryPoint, entryDistance);
-        _candidatesQueue.Enqueue(entry, entryDistance);
-        _nearestQueue.Enqueue(entry, -entryDistance);
-        float lowerBound = entryDistance;
-
-        while (_candidatesQueue.Count > 0)
+        s.Candidates.Enqueue(entry, entryDistance);
+        float lowerBound;
+        if (allowed is null || allowed(entryPoint))
         {
-            Candidate current = _candidatesQueue.Dequeue();
+            s.Nearest.Enqueue(entry, -entryDistance);
+            lowerBound = entryDistance;
+        }
+        else
+        {
+            lowerBound = float.MaxValue;
+        }
+
+        while (s.Candidates.Count > 0)
+        {
+            Candidate current = s.Candidates.Dequeue();
             if (current.Distance > lowerBound)
             {
                 break;
@@ -469,42 +718,48 @@ public sealed class HnswIndex
 
             foreach (int neighbor in _nodes[current.Index].Links[layer])
             {
-                if (_visitedStamp[neighbor] == version)
+                if (s.Visited[neighbor] == version)
                 {
                     continue;
                 }
 
-                _visitedStamp[neighbor] = version;
+                s.Visited[neighbor] = version;
                 float distance = Distance(query, StoredSpan(neighbor));
-                if (_nearestQueue.Count < ef || distance < lowerBound)
+                if (s.Nearest.Count < ef || distance < lowerBound)
                 {
                     var candidate = new Candidate(neighbor, distance);
-                    _candidatesQueue.Enqueue(candidate, distance);
-                    _nearestQueue.Enqueue(candidate, -distance);
-                    if (_nearestQueue.Count > ef)
+                    s.Candidates.Enqueue(candidate, distance);
+                    if (allowed is null || allowed(neighbor))
                     {
-                        _nearestQueue.Dequeue();
+                        s.Nearest.Enqueue(candidate, -distance);
+                        if (s.Nearest.Count > ef)
+                        {
+                            s.Nearest.Dequeue();
+                        }
                     }
 
-                    _nearestQueue.TryPeek(out _, out float priority);
-                    lowerBound = -priority;
+                    if (s.Nearest.Count > 0)
+                    {
+                        s.Nearest.TryPeek(out _, out float priority);
+                        lowerBound = -priority;
+                    }
                 }
             }
         }
 
-        _layerResult.Clear();
-        foreach ((Candidate element, float _) in _nearestQueue.UnorderedItems)
+        s.LayerResult.Clear();
+        foreach ((Candidate element, float _) in s.Nearest.UnorderedItems)
         {
-            _layerResult.Add(element);
+            s.LayerResult.Add(element);
         }
 
-        _layerResult.Sort(_candidateComparison);
+        s.LayerResult.Sort(_candidateComparison);
     }
 
-    private void SelectNeighbors(List<Candidate> candidates, int maxConnections, List<int> result)
+    private void SelectNeighbors(List<Candidate> candidates, int maxConnections, List<int> result, Scratch s)
     {
         result.Clear();
-        _selectPruned.Clear();
+        s.SelectPruned.Clear();
         candidates.Sort(_candidateComparison);
         foreach (Candidate candidate in candidates)
         {
@@ -529,11 +784,11 @@ public sealed class HnswIndex
             }
             else
             {
-                _selectPruned.Add(candidate);
+                s.SelectPruned.Add(candidate);
             }
         }
 
-        foreach (Candidate candidate in _selectPruned)
+        foreach (Candidate candidate in s.SelectPruned)
         {
             if (!result.Contains(candidate.Index))
             {
@@ -546,7 +801,7 @@ public sealed class HnswIndex
         }
     }
 
-    private void PruneConnections(int nodeIndex, int layer)
+    private void PruneConnections(int nodeIndex, int layer, Scratch s)
     {
         List<int> links = _nodes[nodeIndex].Links[layer];
         int maxConnections = MaxConnections(layer);
@@ -555,16 +810,20 @@ public sealed class HnswIndex
             return;
         }
 
-        _pruneCandidates.Clear();
+        s.PruneCandidates.Clear();
         foreach (int neighbor in links)
         {
-            _pruneCandidates.Add(new Candidate(neighbor, Distance(StoredSpan(nodeIndex), StoredSpan(neighbor))));
+            s.PruneCandidates.Add(new Candidate(neighbor, Distance(StoredSpan(nodeIndex), StoredSpan(neighbor))));
         }
 
-        SelectNeighbors(_pruneCandidates, maxConnections, _pruneSelected);
+        SelectNeighbors(s.PruneCandidates, maxConnections, s.PruneSelected, s);
         links.Clear();
-        links.AddRange(_pruneSelected);
+        links.AddRange(s.PruneSelected);
     }
+
+    private Scratch RentScratch() => _scratchPool.TryTake(out Scratch? s) ? s : new Scratch();
+
+    private void ReturnScratch(Scratch s) => _scratchPool.Add(s);
 
     private int CompareCandidates(Candidate left, Candidate right)
     {
@@ -624,13 +883,52 @@ public sealed class HnswIndex
             }
         }
 
-        public long Id { get; }
+        public long Id { get; set; }
 
-        public float[] OriginalVector { get; }
+        public float[] OriginalVector { get; set; }
 
         public int Level { get; }
 
+        public bool Deleted { get; set; }
+
         public List<int>[] Links { get; }
+    }
+
+    private sealed class Scratch
+    {
+        public int[] Visited = Array.Empty<int>();
+
+        public int Version;
+
+        public readonly PriorityQueue<Candidate, float> Candidates = new();
+
+        public readonly PriorityQueue<Candidate, float> Nearest = new();
+
+        public readonly List<Candidate> LayerResult = new();
+
+        public readonly List<Candidate> PruneCandidates = new();
+
+        public readonly List<Candidate> SelectPruned = new();
+
+        public readonly List<int> AddSelected = new();
+
+        public readonly List<int> PruneSelected = new();
+
+        public int NextVersion(int nodeCount)
+        {
+            if (Visited.Length < nodeCount)
+            {
+                Array.Resize(ref Visited, Math.Max(16, nodeCount * 2));
+            }
+
+            if (++Version == 0)
+            {
+                Array.Clear(Visited);
+                Version = 1;
+            }
+
+            return Version;
+        }
     }
 
     private readonly record struct Candidate(int Index, float Distance);

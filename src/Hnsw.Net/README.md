@@ -13,7 +13,10 @@ Navigable Small World graphs) for approximate nearest-neighbor search over
 - Managed multi-layer HNSW with the paper's neighbor-selection heuristic.
 - Cosine, Euclidean L2, and dot-product similarity.
 - SIMD-accelerated distance kernels (`System.Numerics.Tensors` + a custom vectorized dot product).
-- Versioned binary save/load, plus a portable export/rebuild bridge.
+- Thread-safe concurrent search (builds and modifications are serialized).
+- Predicate filtering, soft delete (`MarkDeleted`/`UnmarkDeleted`) with optional slot reuse.
+- Exact `BruteForceIndex` companion for small collections and exact baselines.
+- Versioned binary save/load (including deleted state), plus a portable export/rebuild bridge.
 - Behavior validated against a Python `hnswlib` parity oracle.
 
 ## Installation
@@ -39,12 +42,25 @@ foreach ((long id, float distance) in index.Search([0.9f, 0.1f, 0], k: 1))
 {
     Console.WriteLine($"{id}: {distance}");
 }
+
+// Filter results, and soft-delete without rebuilding.
+var some = index.Search([0.9f, 0.1f, 0], k: 1, filter: id => id != 2);
+index.MarkDeleted(1);
 ```
 
 Results are ordered by ascending distance. For dot product the distance is the
 negative inner product, so the most similar vectors are returned first. Cosine
 vectors are normalized on add and on query. Duplicate ids throw `ArgumentException`.
-`HnswIndex` is single-threaded for build and search.
+Searches are thread-safe and may run concurrently; build and modification are
+single-writer.
+
+## Scope
+
+This is a full port of the hnswlib runtime feature set (build, search, filtering,
+concurrent search, soft delete and slot reuse, brute force, persistence). Two
+hnswlib capabilities are intentionally excluded: fine-grained parallel build
+(Hnsw.Net builds under a single writer) and hnswlib native index-format interop
+(Hnsw.Net uses its own versioned format plus a portable export/rebuild bridge).
 
 ## Persistence and portability
 

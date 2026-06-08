@@ -16,7 +16,15 @@ against the reference [hnswlib](https://github.com/nmslib/hnswlib). See
 - Supports cosine, Euclidean L2, and dot-product similarity.
 - SIMD-accelerated distance calculations via `System.Numerics.Tensors`
   (`TensorPrimitives`).
-- Versioned binary save/load round-trips indexes without native dependencies.
+- Thread-safe concurrent search; builds and modifications are serialized.
+- Predicate filtering: restrict a search to ids accepted by a caller-supplied
+  `Func<long, bool>`.
+- Soft delete (`MarkDeleted`/`UnmarkDeleted`) with optional reuse of freed slots
+  on subsequent `Add` (`allowReplaceDeleted`).
+- Exact `BruteForceIndex` companion for small collections and for producing
+  exact baselines.
+- Versioned binary save/load round-trips indexes (including deleted state)
+  without native dependencies.
 - Portable export/rebuild bridge for stored ids and vectors.
 - Behavioral parity validation against a committed Python hnswlib oracle.
 
@@ -42,9 +50,44 @@ foreach ((long id, float distance) in index.Search([0.9f, 0.1f, 0], k: 1))
 Results are ordered by ascending distance. For dot product, the distance is the
 negative inner product, so the most similar vectors are returned first.
 
-`HnswIndex` is intended for single-threaded build and search in v1. Duplicate
-ids throw `ArgumentException`. Cosine vectors are normalized when added and
-queries are normalized during search.
+Duplicate ids throw `ArgumentException`. Cosine vectors are normalized when added
+and queries are normalized during search.
+
+## Concurrency, filtering, and deletion
+
+Searches are thread-safe and may run concurrently; concurrent results are
+identical to serial ones. Builds and modifications (`Add`, `MarkDeleted`,
+`UnmarkDeleted`) are serialized under a single writer.
+
+```csharp
+// Restrict results to ids your application currently considers valid.
+var results = index.Search(query, k: 10, filter: id => allowedIds.Contains(id));
+
+// Soft delete keeps the vector in the graph for connectivity but excludes it
+// from results; it can be restored later.
+index.MarkDeleted(2);
+index.UnmarkDeleted(2);
+
+// Opt into slot reuse so deletions do not grow the backing store unbounded.
+var churningIndex = new HnswIndex(dim, DistanceMetric.Cosine, allowReplaceDeleted: true);
+```
+
+`BruteForceIndex` is an exact companion that scans every vector per query. Use it
+for small collections or to validate the approximate index.
+
+## Scope
+
+This is a full port of the hnswlib runtime feature set (build, search, filtering,
+concurrent search, soft delete and slot reuse, brute force, persistence). Two
+hnswlib capabilities are intentionally excluded:
+
+- **Fine-grained parallel build.** Hnsw.Net serializes graph mutation under a
+  single writer. Concurrent search is supported, but build is single-writer; the
+  lock-free per-element link locking hnswlib uses for multithreaded insertion is
+  out of scope (high complexity, low value for the target workloads).
+- **hnswlib native index format interop.** hnswlib's on-disk layout is not a
+  stable, portable wire format. Hnsw.Net uses its own versioned format and a
+  portable export/rebuild bridge instead (see below).
 
 ## Portable export/rebuild
 
