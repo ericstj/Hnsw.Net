@@ -406,8 +406,8 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         JsonTypeInfo recordInfo = ResolveTypeInfo(context, typeof(TRecord));
         LoadCore(
             stream,
-            json => (TKey)JsonSerializer.Deserialize(json, keyInfo)!,
-            json => (TRecord)JsonSerializer.Deserialize(json, recordInfo)!);
+            json => DeserializeWithTypeInfo<TKey>(json, keyInfo),
+            json => DeserializeWithTypeInfo<TRecord>(json, recordInfo));
     }
 
     // Shared binary framing for both the reflection and source-generated overloads. Records and keys are
@@ -501,6 +501,12 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         }
 
         HnswIndex? index = hasIndex ? HnswIndex.Load(stream) : null;
+        if (index is not null && (index.Dimension != dimension || index.Metric != metric))
+        {
+            throw new InvalidDataException(
+                $"Corrupt Hnsw.Net collection snapshot: the index header (dimension {index.Dimension}, metric {index.Metric}) " +
+                $"does not match the snapshot header (dimension {dimension}, metric {metric}).");
+        }
 
         // Update the existing per-collection data in place so its Lock object stays stable for any
         // other threads that already captured it via GetData().
@@ -537,6 +543,10 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         _collectionTypes[Name] = typeof(TRecord);
     }
 
+    // An individual key or record payload should never be huge; cap it so a corrupt length prefix on a
+    // non-seekable stream cannot trigger a denial-of-service allocation before truncation is detected.
+    private const int MaxPayloadLength = 128 * 1024 * 1024;
+
     private static byte[] ReadExact(BinaryReader reader, int length)
     {
         if (length < 0)
@@ -544,8 +554,12 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative payload length.");
         }
 
-        // Guard against a bogus length prefix triggering a huge up-front allocation: when the stream is
-        // seekable, the payload cannot be larger than the bytes that remain.
+        if (length > MaxPayloadLength)
+        {
+            throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: payload length exceeds the maximum supported size.");
+        }
+
+        // When the stream is seekable, the payload cannot be larger than the bytes that remain.
         Stream baseStream = reader.BaseStream;
         if (baseStream.CanSeek && length > baseStream.Length - baseStream.Position)
         {
@@ -565,6 +579,11 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         => context.GetTypeInfo(type) ?? throw new InvalidOperationException(
             $"The supplied JsonSerializerContext does not provide metadata for type '{type}'. " +
             $"Add a [JsonSerializable] attribute for it to the context.");
+
+    private static T DeserializeWithTypeInfo<T>(byte[] json, JsonTypeInfo typeInfo)
+        => JsonSerializer.Deserialize(json, typeInfo) is T value
+            ? value
+            : throw new InvalidDataException($"Invalid Hnsw.Net collection snapshot: could not deserialize a '{typeof(T)}'.");
 
     [RequiresUnreferencedCode("Serializes by reflection.")]
     [RequiresDynamicCode("Serializes by reflection.")]
