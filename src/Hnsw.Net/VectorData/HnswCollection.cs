@@ -424,6 +424,7 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                 writer.Write(SnapshotMagic);
                 writer.Write(SnapshotVersion);
                 writer.Write(data.Dimension);
+                writer.Write((int)_metric);
                 writer.Write(data.NextId);
                 writer.Write(data.Records.Count);
                 foreach (KeyValuePair<object, HnswCollectionData.Entry> kvp in data.Records)
@@ -449,6 +450,7 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         ArgumentNullException.ThrowIfNull(stream);
 
         int dimension;
+        DistanceMetric metric;
         long nextId;
         bool hasIndex;
         var entries = new List<(TKey Key, long Id, TRecord Record)>();
@@ -465,13 +467,33 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             }
 
             dimension = reader.ReadInt32();
+            metric = (DistanceMetric)reader.ReadInt32();
             nextId = reader.ReadInt64();
+
+            int configured = _model.VectorProperty.Dimensions;
+            if (configured > 0 && dimension > 0 && dimension != configured)
+            {
+                throw new InvalidDataException(
+                    $"The snapshot's vector dimension ({dimension}) does not match the collection's configured dimension ({configured}).");
+            }
+
+            if (metric != _metric)
+            {
+                throw new InvalidDataException(
+                    $"The snapshot's distance metric ({metric}) does not match the collection's configured metric ({_metric}).");
+            }
+
             int count = reader.ReadInt32();
+            if (count < 0)
+            {
+                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative record count.");
+            }
+
             for (int i = 0; i < count; i++)
             {
                 long id = reader.ReadInt64();
-                byte[] keyJson = reader.ReadBytes(reader.ReadInt32());
-                byte[] recordJson = reader.ReadBytes(reader.ReadInt32());
+                byte[] keyJson = ReadExact(reader, reader.ReadInt32());
+                byte[] recordJson = ReadExact(reader, reader.ReadInt32());
                 entries.Add((deserializeKey(keyJson), id, deserializeRecord(recordJson)));
             }
 
@@ -480,18 +502,43 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
 
         HnswIndex? index = hasIndex ? HnswIndex.Load(stream) : null;
 
-        var data = new HnswCollectionData { Dimension = dimension, NextId = nextId, Index = index };
-        foreach ((TKey key, long id, TRecord record) in entries)
+        // Update the existing per-collection data in place so its Lock object stays stable for any
+        // other threads that already captured it via GetData().
+        HnswCollectionData data = _collections.GetOrAdd(Name, static _ => new HnswCollectionData());
+        lock (data.Lock)
         {
-            ReadOnlyMemory<float> vector = index is not null && index.TryGetVector(id, out float[] v)
-                ? v
-                : ReadOnlyMemory<float>.Empty;
-            data.Records[key!] = new HnswCollectionData.Entry { Record = record!, Id = id, Vector = vector };
-            data.IdToKey[id] = key!;
+            data.Records.Clear();
+            data.IdToKey.Clear();
+            data.Dimension = dimension;
+            data.NextId = nextId;
+            data.Index = index;
+            foreach ((TKey key, long id, TRecord record) in entries)
+            {
+                ReadOnlyMemory<float> vector = index is not null && index.TryGetVector(id, out float[] v)
+                    ? v
+                    : ReadOnlyMemory<float>.Empty;
+                data.Records[key!] = new HnswCollectionData.Entry { Record = record!, Id = id, Vector = vector };
+                data.IdToKey[id] = key!;
+            }
         }
 
-        _collections[Name] = data;
         _collectionTypes[Name] = typeof(TRecord);
+    }
+
+    private static byte[] ReadExact(BinaryReader reader, int length)
+    {
+        if (length < 0)
+        {
+            throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative payload length.");
+        }
+
+        byte[] payload = reader.ReadBytes(length);
+        if (payload.Length != length)
+        {
+            throw new InvalidDataException("Truncated Hnsw.Net collection snapshot.");
+        }
+
+        return payload;
     }
 
     private static JsonTypeInfo ResolveTypeInfo(JsonSerializerContext context, Type type)

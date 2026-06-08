@@ -190,6 +190,54 @@ public partial class VectorStoreTests
         Assert.Equal("z axis", fetched!.Text);
     }
 
+    [Fact]
+    public async Task Load_DimensionMismatch_Throws()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var ms = new MemoryStream();
+        collection.Save(ms);
+        ms.Position = 0;
+
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            {
+                new VectorStoreKeyProperty(nameof(Doc.Id), typeof(int)),
+                new VectorStoreVectorProperty(nameof(Doc.Vector), typeof(ReadOnlyMemory<float>), 5)
+                {
+                    DistanceFunction = DistanceFunction.CosineSimilarity,
+                },
+            },
+        };
+        var mismatched = new HnswVectorStore().GetCollection<int, Doc>("docs", definition);
+
+        Assert.Throws<InvalidDataException>(() => mismatched.Load(ms));
+    }
+
+    [Fact]
+    public async Task Load_MetricMismatch_Throws()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var ms = new MemoryStream();
+        collection.Save(ms);
+        ms.Position = 0;
+
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            {
+                new VectorStoreKeyProperty(nameof(Doc.Id), typeof(int)),
+                new VectorStoreVectorProperty(nameof(Doc.Vector), typeof(ReadOnlyMemory<float>), 3)
+                {
+                    DistanceFunction = DistanceFunction.EuclideanDistance,
+                },
+            },
+        };
+        var mismatched = new HnswVectorStore().GetCollection<int, Doc>("docs", definition);
+
+        Assert.Throws<InvalidDataException>(() => mismatched.Load(ms));
+    }
+
     private sealed class StringDoc
     {
         [VectorStoreKey]
