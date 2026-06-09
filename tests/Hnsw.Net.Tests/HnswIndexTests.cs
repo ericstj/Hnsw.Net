@@ -70,6 +70,57 @@ public sealed class HnswIndexTests
     }
 
     [Fact]
+    public void LoadMappedProducesIdenticalResultsAndIsReadOnly()
+    {
+        const int count = 300;
+        const int dimension = 32;
+        float[][] vectors = RandomVectors(count, dimension, seed: 222);
+        float[][] queries = RandomVectors(8, dimension, seed: 333);
+        var index = new HnswIndex(dimension, DistanceMetric.Cosine, m: 16, efConstruction: 120, seed: 44)
+        {
+            Ef = 80,
+        };
+
+        for (int i = 0; i < vectors.Length; i++)
+        {
+            index.Add(10_000 + i, vectors[i]);
+        }
+
+        string path = Path.GetTempFileName();
+        try
+        {
+            using (var file = new FileStream(path, FileMode.Create, FileAccess.Write))
+            {
+                index.Save(file);
+            }
+
+            using (HnswIndex mapped = HnswIndex.LoadMapped(path))
+            {
+                Assert.Equal(index.Count, mapped.Count);
+                foreach (float[] query in queries)
+                {
+                    Assert.Equal(index.Search(query, 12), mapped.Search(query, 12));
+                }
+
+                Assert.True(mapped.TryGetVector(10_000, out float[] stored));
+                Assert.Equal(Normalize(vectors[0]), stored);
+                Assert.Throws<InvalidOperationException>(() => mapped.Add(99_999, vectors[0]));
+            }
+
+            // Dispose must release the mapping so the file is no longer locked.
+            File.Delete(path);
+            Assert.False(File.Exists(path));
+        }
+        finally
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+    }
+
+    [Fact]
     public void SaveLoadRoundTripProducesIdenticalResults()
     {
         const int count = 300;

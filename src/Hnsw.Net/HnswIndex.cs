@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.IO.MemoryMappedFiles;
 using System.Numerics;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
@@ -11,7 +12,7 @@ namespace HnswNet;
 /// An HNSW approximate-nearest-neighbor index over <see cref="float" /> vectors.
 /// Builds and modifications are serialized; searches are thread-safe and may run concurrently.
 /// </summary>
-public sealed class HnswIndex
+public sealed class HnswIndex : IDisposable
 {
     private const int FormatVersion = 4;
     private const uint Magic = 0x31575348; // HSW1, little-endian.
@@ -62,7 +63,7 @@ public sealed class HnswIndex
         _levelMultiplier = 1.0 / Math.Log(m);
         _allowReplaceDeleted = allowReplaceDeleted;
         _candidateComparison = CompareCandidates;
-        _vectors = new VectorBlock(dimension);
+        _vectors = new HeapVectorBlock(dimension);
     }
 
     private HnswIndex(int dimension, DistanceMetric metric, int m, int efConstruction, int ef, int entryPoint, int maxLevel, bool allowReplaceDeleted)
@@ -78,7 +79,7 @@ public sealed class HnswIndex
         _levelMultiplier = 1.0 / Math.Log(m);
         _allowReplaceDeleted = allowReplaceDeleted;
         _candidateComparison = CompareCandidates;
-        _vectors = new VectorBlock(dimension);
+        _vectors = new HeapVectorBlock(dimension);
     }
 
     /// <summary>Gets the vector dimension.</summary>
@@ -178,6 +179,11 @@ public sealed class HnswIndex
     public void Add(long id, ReadOnlySpan<float> vector)
     {
         ValidateVector(vector);
+        if (_vectors.IsReadOnly)
+        {
+            throw new InvalidOperationException("This index was loaded with memory-mapped vectors and is read-only. Load it without mapping to modify it.");
+        }
+
         _lock.EnterWriteLock();
         try
         {
@@ -494,17 +500,22 @@ public sealed class HnswIndex
             writer.Write(_nodes.Count);
             writer.Write(_allowReplaceDeleted);
 
+            // Vector section: one normalized vector per slot, contiguous and fixed-stride, so the
+            // read path can memory-map it and address slot s at base + s * Dimension * sizeof(float).
+            // Written as raw little-endian float blocks (byte-identical to a per-float loop on the
+            // LE platforms .NET targets, but without millions of scalar writes).
+            for (int n = 0; n < _nodes.Count; n++)
+            {
+                writer.Write(MemoryMarshal.AsBytes(StoredSpan(n)));
+            }
+
+            // Graph section: per-node metadata and link lists, kept separate from the vectors.
             for (int n = 0; n < _nodes.Count; n++)
             {
                 Node node = _nodes[n];
                 writer.Write(node.Id);
                 writer.Write(node.Level);
                 writer.Write(node.Deleted);
-                // Vectors are written as raw little-endian float blocks; on the LE platforms .NET
-                // targets this is byte-identical to a per-element BinaryWriter.Write(float) loop but
-                // avoids millions of scalar writes on large indexes.
-                writer.Write(MemoryMarshal.AsBytes(StoredSpan(n)));
-
                 writer.Write(node.Links.Length);
                 for (int layer = 0; layer < node.Links.Length; layer++)
                 {
@@ -522,15 +533,98 @@ public sealed class HnswIndex
         }
     }
 
-    /// <summary>Loads an index saved by <see cref="Save" />.</summary>
+    /// <summary>Loads an index saved by <see cref="Save" /> into managed memory.</summary>
     public static HnswIndex Load(Stream stream)
     {
         ArgumentNullException.ThrowIfNull(stream);
         using var reader = new BinaryReader(stream, System.Text.Encoding.UTF8, leaveOpen: true);
+        Header header = ReadHeader(reader);
+        var index = new HnswIndex(header.Dimension, header.Metric, header.M, header.EfConstruction, header.Ef, header.EntryPoint, header.MaxLevel, header.AllowReplaceDeleted);
+        index._vectors.EnsureCapacity(header.Count);
+
+        if (header.Version <= 3)
+        {
+            ReadInterleavedBody(reader, index, header);
+        }
+        else
+        {
+            // Vector section first (one vector per slot), then the graph section.
+            for (int i = 0; i < header.Count; i++)
+            {
+                ReadExactInto(reader, MemoryMarshal.AsBytes(index._vectors.VectorMutable(i)));
+            }
+
+            for (int i = 0; i < header.Count; i++)
+            {
+                long id = reader.ReadInt64();
+                int level = reader.ReadInt32();
+                bool deleted = reader.ReadBoolean();
+                ReadNodeLinks(reader, index, i, id, level, deleted, header);
+            }
+        }
+
+        return index;
+    }
+
+    /// <summary>
+    /// Loads an index from a file, memory-mapping the vector section instead of reading it into the
+    /// managed heap. The graph is still loaded into memory. The returned index is read-only (calls to
+    /// <see cref="Add(long, ReadOnlySpan{float})" /> throw) and owns the mapping, so it must be disposed.
+    /// Only the current on-disk format is supported; re-save older indexes first.
+    /// </summary>
+    public static HnswIndex LoadMapped(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        Header header;
+        long vectorOffset;
+        HnswIndex index;
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var reader = new BinaryReader(stream, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            header = ReadHeader(reader);
+            if (header.Version != FormatVersion)
+            {
+                throw new InvalidDataException("Memory-mapped loading requires the current index format; re-save the index.");
+            }
+
+            vectorOffset = stream.Position;
+            long vectorBytes = (long)header.Count * header.Dimension * sizeof(float);
+            index = new HnswIndex(header.Dimension, header.Metric, header.M, header.EfConstruction, header.Ef, header.EntryPoint, header.MaxLevel, header.AllowReplaceDeleted);
+
+            stream.Seek(vectorOffset + vectorBytes, SeekOrigin.Begin);
+            for (int i = 0; i < header.Count; i++)
+            {
+                long id = reader.ReadInt64();
+                int level = reader.ReadInt32();
+                bool deleted = reader.ReadBoolean();
+                ReadNodeLinks(reader, index, i, id, level, deleted, header);
+            }
+        }
+
+        MemoryMappedFile? file = null;
+        MemoryMappedViewAccessor? view = null;
+        try
+        {
+            file = MemoryMappedFile.CreateFromFile(path, FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
+            view = file.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            index._vectors = new MappedVectorBlock(file, view, vectorOffset, header.Dimension);
+            return index;
+        }
+        catch
+        {
+            view?.Dispose();
+            file?.Dispose();
+            throw;
+        }
+    }
+
+    private static Header ReadHeader(BinaryReader reader)
+    {
         if (reader.ReadUInt32() != Magic)
         {
             throw new InvalidDataException("The stream is not an Hnsw.Net index.");
         }
+
         int version = reader.ReadInt32();
         if (version is < 1 or > FormatVersion)
         {
@@ -546,54 +640,77 @@ public sealed class HnswIndex
         int maxLevel = reader.ReadInt32();
         int count = reader.ReadInt32();
         bool allowReplaceDeleted = version >= 3 && reader.ReadBoolean();
-        var index = new HnswIndex(dimension, metric, m, efConstruction, ef, entryPoint, maxLevel, allowReplaceDeleted);
-        index._vectors.EnsureCapacity(count);
+        return new Header(version, dimension, metric, m, efConstruction, ef, entryPoint, maxLevel, count, allowReplaceDeleted);
+    }
 
+    // Reads the pre-v4 layout where each node's vector(s) are interleaved with its graph data.
+    private static void ReadInterleavedBody(BinaryReader reader, HnswIndex index, Header header)
+    {
         // Formats 2 and 3 stored a second copy of the pre-normalized vector per node; it is read and
         // discarded since only the (normalized) stored vector is retained now.
-        float[] discard = version is 2 or 3 ? new float[dimension] : Array.Empty<float>();
-
-        for (int i = 0; i < count; i++)
+        float[] discard = header.Version is 2 or 3 ? new float[header.Dimension] : Array.Empty<float>();
+        for (int i = 0; i < header.Count; i++)
         {
             long id = reader.ReadInt64();
             int level = reader.ReadInt32();
-            bool deleted = version >= 3 && reader.ReadBoolean();
-            Span<float> stored = index._vectors.VectorMutable(i);
-            ReadExactInto(reader, MemoryMarshal.AsBytes(stored));
+            bool deleted = header.Version >= 3 && reader.ReadBoolean();
+            ReadExactInto(reader, MemoryMarshal.AsBytes(index._vectors.VectorMutable(i)));
             if (discard.Length > 0)
             {
                 ReadExactInto(reader, MemoryMarshal.AsBytes(discard.AsSpan()));
             }
 
-            var node = new Node(id, level) { Deleted = deleted };
-            int layerCount = reader.ReadInt32();
-            if (layerCount != level + 1)
-            {
-                throw new InvalidDataException("Invalid layer count in Hnsw.Net index.");
-            }
+            ReadNodeLinks(reader, index, i, id, level, deleted, header);
+        }
+    }
 
-            for (int layer = 0; layer < layerCount; layer++)
-            {
-                int linkCount = reader.ReadInt32();
-                for (int link = 0; link < linkCount; link++)
-                {
-                    node.Links[layer].Add(reader.ReadInt32());
-                }
-            }
+    private static void ReadNodeLinks(BinaryReader reader, HnswIndex index, int i, long id, int level, bool deleted, Header header)
+    {
+        var node = new Node(id, level) { Deleted = deleted };
+        int layerCount = reader.ReadInt32();
+        if (layerCount != level + 1)
+        {
+            throw new InvalidDataException("Invalid layer count in Hnsw.Net index.");
+        }
 
-            index._ids.Add(id, i);
-            index._nodes.Add(node);
-            if (deleted)
+        for (int layer = 0; layer < layerCount; layer++)
+        {
+            int linkCount = reader.ReadInt32();
+            for (int link = 0; link < linkCount; link++)
             {
-                index._deletedCount++;
-                if (allowReplaceDeleted && i != entryPoint)
-                {
-                    index._deletedSlots.Push(i);
-                }
+                node.Links[layer].Add(reader.ReadInt32());
             }
         }
 
-        return index;
+        index._ids.Add(id, i);
+        index._nodes.Add(node);
+        if (deleted)
+        {
+            index._deletedCount++;
+            if (header.AllowReplaceDeleted && i != header.EntryPoint)
+            {
+                index._deletedSlots.Push(i);
+            }
+        }
+    }
+
+    private readonly record struct Header(
+        int Version,
+        int Dimension,
+        DistanceMetric Metric,
+        int M,
+        int EfConstruction,
+        int Ef,
+        int EntryPoint,
+        int MaxLevel,
+        int Count,
+        bool AllowReplaceDeleted);
+
+    /// <summary>Releases the memory mapping held by an index loaded via <see cref="LoadMapped" />.</summary>
+    public void Dispose()
+    {
+        (_vectors as IDisposable)?.Dispose();
+        _lock.Dispose();
     }
 
     private void ValidateVector(ReadOnlySpan<float> vector)
@@ -869,18 +986,31 @@ public sealed class HnswIndex
         return sum;
     }
 
-    // Chunked, slot-addressed storage for the normalized search vectors. Splitting the data into
-    // bounded chunks keeps each backing array well under the .NET array length limit so the index
-    // scales to very large repos, and gives every slot a contiguous span ready for a future
-    // memory-mapped backing.
-    private sealed class VectorBlock
+    // Slot-addressed storage for the normalized search vectors. The read path goes through this
+    // abstraction so the backing store can be either the managed heap (build and default load) or a
+    // memory-mapped file (LoadMapped).
+    private abstract class VectorBlock
+    {
+        public abstract bool IsReadOnly { get; }
+
+        public abstract void EnsureCapacity(int slotCount);
+
+        public abstract ReadOnlySpan<float> Vector(int slot);
+
+        public abstract Span<float> VectorMutable(int slot);
+    }
+
+    // Chunked heap storage. Splitting the data into bounded chunks keeps each backing array well
+    // under the .NET array length limit so the index scales to very large repos, and gives every
+    // slot a contiguous span.
+    private sealed class HeapVectorBlock : VectorBlock
     {
         private readonly int _dimension;
         private readonly int _vectorsPerChunk;
         private readonly List<float[]> _chunks = new();
         private int _capacity;
 
-        public VectorBlock(int dimension)
+        public HeapVectorBlock(int dimension)
         {
             _dimension = dimension;
 
@@ -891,7 +1021,9 @@ public sealed class HnswIndex
             _vectorsPerChunk = (int)Math.Min(perChunk, int.MaxValue / dimension);
         }
 
-        public void EnsureCapacity(int slotCount)
+        public override bool IsReadOnly => false;
+
+        public override void EnsureCapacity(int slotCount)
         {
             while (_capacity < slotCount)
             {
@@ -900,15 +1032,62 @@ public sealed class HnswIndex
             }
         }
 
-        public ReadOnlySpan<float> Vector(int slot) => Slot(slot);
+        public override ReadOnlySpan<float> Vector(int slot) => Slot(slot);
 
-        public Span<float> VectorMutable(int slot) => Slot(slot);
+        public override Span<float> VectorMutable(int slot) => Slot(slot);
 
         private Span<float> Slot(int slot)
         {
             int chunk = slot / _vectorsPerChunk;
             int offset = (slot % _vectorsPerChunk) * _dimension;
             return _chunks[chunk].AsSpan(offset, _dimension);
+        }
+    }
+
+    // Read-only storage backed by a memory-mapped file. Each slot is served as a span straight off
+    // the mapped pages; the file is addressed with long offsets so the vector section can exceed the
+    // .NET array length limit while each per-slot span stays within it.
+    private sealed unsafe class MappedVectorBlock : VectorBlock, IDisposable
+    {
+        private readonly MemoryMappedFile _file;
+        private readonly MemoryMappedViewAccessor _view;
+        private readonly long _vectorOffset;
+        private readonly int _dimension;
+        private byte* _base;
+
+        public MappedVectorBlock(MemoryMappedFile file, MemoryMappedViewAccessor view, long vectorOffset, int dimension)
+        {
+            _file = file;
+            _view = view;
+            _vectorOffset = vectorOffset;
+            _dimension = dimension;
+            byte* pointer = null;
+            view.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
+            _base = pointer + view.PointerOffset;
+        }
+
+        public override bool IsReadOnly => true;
+
+        public override void EnsureCapacity(int slotCount)
+        {
+        }
+
+        public override ReadOnlySpan<float> Vector(int slot)
+            => new(_base + _vectorOffset + (long)slot * _dimension * sizeof(float), _dimension);
+
+        public override Span<float> VectorMutable(int slot)
+            => throw new NotSupportedException("Memory-mapped vectors are read-only.");
+
+        public void Dispose()
+        {
+            if (_base != null)
+            {
+                _view.SafeMemoryMappedViewHandle.ReleasePointer();
+                _base = null;
+            }
+
+            _view.Dispose();
+            _file.Dispose();
         }
     }
 
