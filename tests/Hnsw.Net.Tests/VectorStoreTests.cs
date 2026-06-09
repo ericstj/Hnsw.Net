@@ -302,6 +302,36 @@ public partial class VectorStoreTests
     }
 
     [Fact]
+    public async Task Save_NonWritableStream_Throws()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var readOnly = new MemoryStream(Array.Empty<byte>(), writable: false);
+        Assert.Throws<ArgumentException>(() => collection.Save(readOnly));
+    }
+
+    [Fact]
+    public async Task Load_NonReadableStream_Throws()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var writeOnly = new WriteOnlyStream();
+        Assert.Throws<ArgumentException>(() => collection.Load(writeOnly));
+    }
+
+    private sealed class WriteOnlyStream : Stream
+    {
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => 0;
+        public override long Position { get => 0; set { } }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) { }
+        public override void Write(byte[] buffer, int offset, int count) { }
+    }
+
+    [Fact]
     public async Task Load_CorruptIndexRegion_ThrowsInvalidData()
     {
         byte[] bytes = await SaveSnapshotAsync();

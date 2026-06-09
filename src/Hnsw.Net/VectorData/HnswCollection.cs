@@ -415,6 +415,10 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
     private void SaveCore(Stream stream, Func<TKey, byte[]> serializeKey, Func<TRecord, byte[]> serializeRecord)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanWrite)
+        {
+            throw new ArgumentException("The stream is not writable.", nameof(stream));
+        }
 
         HnswCollectionData data = GetData();
         lock (data.Lock)
@@ -470,6 +474,10 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
     private void LoadCore(Stream stream, Func<byte[], TKey> deserializeKey, Func<byte[], TRecord> deserializeRecord)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanRead)
+        {
+            throw new ArgumentException("The stream is not readable.", nameof(stream));
+        }
 
         int dimension;
         DistanceMetric metric;
