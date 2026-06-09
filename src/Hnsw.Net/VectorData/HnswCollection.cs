@@ -593,6 +593,12 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         var newIdToKey = new Dictionary<long, TKey>();
         foreach ((TKey key, long id, TRecord record) in entries)
         {
+            if (id < 0)
+            {
+                throw new InvalidDataException(
+                    $"Corrupt Hnsw.Net collection snapshot: negative record id {id}.");
+            }
+
             if (id >= nextId)
             {
                 throw new InvalidDataException(

@@ -261,6 +261,16 @@ public partial class VectorStoreTests
     }
 
     [Fact]
+    public async Task Load_NegativeRecordId_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(28), -1L); // first record id
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
     public async Task Load_NextIdNotGreaterThanRecordIds_Throws()
     {
         byte[] bytes = await SaveSnapshotAsync();
