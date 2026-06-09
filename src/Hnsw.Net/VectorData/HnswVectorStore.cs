@@ -90,9 +90,27 @@ public sealed class HnswVectorStore : VectorStore
     /// <inheritdoc />
     public override Task EnsureCollectionDeletedAsync(string name, CancellationToken cancellationToken = default)
     {
-        _collections.TryRemove(name, out _);
+        if (_collections.TryRemove(name, out HnswCollectionData? data))
+        {
+            data.Dispose();
+        }
+
         _collectionTypes.TryRemove(name, out _);
         return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            foreach (HnswCollectionData data in _collections.Values)
+            {
+                data.Dispose();
+            }
+        }
+
+        base.Dispose(disposing);
     }
 
     /// <inheritdoc />

@@ -112,9 +112,26 @@ HnswIndex rebuilt = HnswIndex.Build(
     seed: 42);
 ```
 
-`ExportItems` returns copies of the original vectors passed to `Add`. Cosine
-vectors are still stored normalized internally for search, but the portable
-export preserves the original input values; rebuilding normalizes them again.
+`ExportItems` returns copies of the stored vectors. For cosine these are the
+unit-normalized vectors used for search (not the original input magnitudes);
+rebuilding from them re-normalizes and reproduces the same index. Other metrics
+store vectors unchanged, so the export matches the input.
+
+## Memory-mapped loading
+
+For large indexes or cold-start-heavy scenarios, `LoadMapped` memory-maps the
+vector section of a saved file instead of reading it into the managed heap. The
+graph is still loaded into memory, so search stays fast while the bulk of the
+data (the vectors) is paged in on demand by the OS:
+
+```csharp
+using HnswIndex index = HnswIndex.LoadMapped("index.hnsw");
+IReadOnlyList<(long Id, float Distance)> hits = index.Search(query, 10);
+```
+
+The returned index owns the mapping and is read-only — it must be disposed, and
+`Add` throws. To modify an index, load it with `Load` instead. `LoadMapped`
+requires the current on-disk format; re-save older indexes first.
 
 ## hnswlib parity validation
 

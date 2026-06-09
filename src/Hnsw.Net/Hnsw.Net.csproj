@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <Optimize>true</Optimize>
     <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>HnswNet</RootNamespace>
     <AssemblyName>Hnsw.Net</AssemblyName>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>

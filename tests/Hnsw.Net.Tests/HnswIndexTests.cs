@@ -1,3 +1,4 @@
+using System.Numerics.Tensors;
 using HnswNet;
 using Xunit;
 
@@ -69,6 +70,63 @@ public sealed class HnswIndexTests
     }
 
     [Fact]
+    public void LoadMappedProducesIdenticalResultsAndIsReadOnly()
+    {
+        const int count = 300;
+        const int dimension = 32;
+        float[][] vectors = RandomVectors(count, dimension, seed: 222);
+        float[][] queries = RandomVectors(8, dimension, seed: 333);
+        var index = new HnswIndex(dimension, DistanceMetric.Cosine, m: 16, efConstruction: 120, seed: 44)
+        {
+            Ef = 80,
+        };
+
+        for (int i = 0; i < vectors.Length; i++)
+        {
+            index.Add(10_000 + i, vectors[i]);
+        }
+
+        string path = Path.GetTempFileName();
+        try
+        {
+            using (var file = new FileStream(path, FileMode.Create, FileAccess.Write))
+            {
+                index.Save(file);
+            }
+
+            using (HnswIndex mapped = HnswIndex.LoadMapped(path))
+            {
+                Assert.Equal(index.Count, mapped.Count);
+                foreach (float[] query in queries)
+                {
+                    Assert.Equal(index.Search(query, 12), mapped.Search(query, 12));
+                }
+
+                Assert.True(mapped.TryGetVector(10_000, out float[] stored));
+                Assert.Equal(Normalize(vectors[0]), stored);
+                Assert.Throws<InvalidOperationException>(() => mapped.Add(99_999, vectors[0]));
+                Assert.Throws<InvalidOperationException>(() => mapped.MarkDeleted(10_000));
+                Assert.Throws<InvalidOperationException>(() => mapped.UnmarkDeleted(10_000));
+
+                // Dispose must be idempotent (ReaderWriterLockSlim cannot be disposed twice).
+                mapped.Dispose();
+                mapped.Dispose();
+            }
+
+            // Dispose must release the mapping so the file is no longer locked.
+            File.Delete(path);
+            Assert.False(File.Exists(path));
+        }
+        finally
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+    }
+
+    [Fact]
     public void SaveLoadRoundTripProducesIdenticalResults()
     {
         const int count = 300;
@@ -98,7 +156,7 @@ public sealed class HnswIndexTests
     }
 
     [Fact]
-    public void ExportItemsRebuildsPortableIndexWithOriginalVectors()
+    public void ExportItemsRebuildsPortableIndexWithStoredVectors()
     {
         const int count = 400;
         const int dimension = 32;
@@ -114,17 +172,19 @@ public sealed class HnswIndexTests
             index.Add(50_000 + i, vectors[i]);
         }
 
+        // Cosine stores unit-normalized vectors, so that is what is exported.
+        float[] expected0 = Normalize(vectors[0]);
         (long Id, float[] Vector)[] exported = index.ExportItems().ToArray();
         Assert.Equal(count, exported.Length);
-        Assert.Equal(vectors[0], exported[0].Vector);
+        Assert.Equal(expected0, exported[0].Vector);
         exported[0].Vector[0] = 12345;
-        Assert.Equal(vectors[0][0], index.ExportItems().First().Vector[0]);
+        Assert.Equal(expected0[0], index.ExportItems().First().Vector[0]);
 
         using var stream = new MemoryStream();
         index.Save(stream);
         stream.Position = 0;
         HnswIndex loaded = HnswIndex.Load(stream);
-        Assert.Equal(vectors[0], loaded.ExportItems().First().Vector);
+        Assert.Equal(expected0, loaded.ExportItems().First().Vector);
 
         HnswIndex rebuilt = HnswIndex.Build(
             dimension,
@@ -140,6 +200,129 @@ public sealed class HnswIndexTests
         {
             Assert.Equal(index.Search(query, 10).Select(r => r.Id), rebuilt.Search(query, 10).Select(r => r.Id));
         }
+    }
+
+    [Fact]
+    public void LoadsLegacyV3FormatAndDiscardsDuplicateVector()
+    {
+        // Hand-craft a version-3 stream: a single DotProduct node (stored == original) so the loader
+        // must read and discard the second vector copy that older formats persisted.
+        const uint magic = 0x31575348;
+        float[] vector = [1f, 2f, 3f];
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write(magic);
+            writer.Write(3);                                 // version
+            writer.Write(vector.Length);                     // dimension
+            writer.Write((int)DistanceMetric.DotProduct);    // metric
+            writer.Write(2);                                 // m
+            writer.Write(10);                                // efConstruction
+            writer.Write(10);                                // ef
+            writer.Write(0);                                 // entryPoint
+            writer.Write(0);                                 // maxLevel
+            writer.Write(1);                                 // count
+            writer.Write(false);                             // allowReplaceDeleted
+
+            writer.Write(7L);                                // id
+            writer.Write(0);                                 // level
+            writer.Write(false);                             // deleted
+            foreach (float f in vector) writer.Write(f);     // stored vector
+            foreach (float f in vector) writer.Write(f);     // original vector (discarded on load)
+            writer.Write(1);                                 // layer count
+            writer.Write(0);                                 // layer 0 link count
+        }
+
+        stream.Position = 0;
+        HnswIndex loaded = HnswIndex.Load(stream);
+        Assert.Equal(1, loaded.Count);
+        Assert.True(loaded.TryGetVector(7, out float[] stored));
+        Assert.Equal(vector, stored);
+        Assert.Equal(7, loaded.Search(vector, 1)[0].Id);
+    }
+
+    [Fact]
+    public void RejectsOutOfRangeLinkIndexOnLoad()
+    {
+        byte[] payload = BuildV4StreamWithLink(neighbor: 5, count: 2, dimension: 3);
+
+        Assert.Throws<InvalidDataException>(() => HnswIndex.Load(new MemoryStream(payload)));
+
+        string path = Path.Combine(Path.GetTempPath(), $"hnsw_corrupt_{Guid.NewGuid():N}.bin");
+        try
+        {
+            File.WriteAllBytes(path, payload);
+            Assert.Throws<InvalidDataException>(() => HnswIndex.LoadMapped(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void RejectsNonPositiveDimensionOnLoad()
+    {
+        byte[] payload = BuildV4StreamWithLink(neighbor: 0, count: 0, dimension: 0);
+        Assert.Throws<InvalidDataException>(() => HnswIndex.Load(new MemoryStream(payload)));
+
+        string path = Path.Combine(Path.GetTempPath(), $"hnsw_dim0_{Guid.NewGuid():N}.bin");
+        try
+        {
+            File.WriteAllBytes(path, payload);
+            Assert.Throws<InvalidDataException>(() => HnswIndex.LoadMapped(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    // Hand-craft a current-format (v4) stream of `count` zero vectors where the first node carries a
+    // single layer-0 link to `neighbor`, used to verify out-of-range links are rejected at load.
+    private static byte[] BuildV4StreamWithLink(int neighbor, int count, int dimension)
+    {
+        const uint magic = 0x31575348;
+        const int version = 4;
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write(magic);
+            writer.Write(version);
+            writer.Write(dimension);
+            writer.Write((int)DistanceMetric.DotProduct);
+            writer.Write(2);                                 // m
+            writer.Write(10);                                // efConstruction
+            writer.Write(10);                                // ef
+            writer.Write(0);                                 // entryPoint
+            writer.Write(0);                                 // maxLevel
+            writer.Write(count);
+            writer.Write(false);                             // allowReplaceDeleted
+
+            for (int n = 0; n < count; n++)                  // vector section
+            {
+                for (int j = 0; j < dimension; j++) writer.Write(0f);
+            }
+
+            for (int n = 0; n < count; n++)                  // graph section
+            {
+                writer.Write((long)n);                       // id
+                writer.Write(0);                             // level
+                writer.Write(false);                         // deleted
+                writer.Write(1);                             // layer count
+                if (n == 0)
+                {
+                    writer.Write(1);                         // layer 0 link count
+                    writer.Write(neighbor);                  // out-of-range neighbor
+                }
+                else
+                {
+                    writer.Write(0);
+                }
+            }
+        }
+
+        return stream.ToArray();
     }
 
     [Fact]
@@ -172,6 +355,18 @@ public sealed class HnswIndexTests
         }
 
         return vectors;
+    }
+
+    private static float[] Normalize(float[] vector)
+    {
+        var copy = (float[])vector.Clone();
+        float norm = MathF.Sqrt(TensorPrimitives.Dot(copy, copy));
+        if (norm > 0)
+        {
+            TensorPrimitives.Divide(copy, norm, copy);
+        }
+
+        return copy;
     }
 
     private static IReadOnlyList<(long Id, float Distance)> BruteForce(
