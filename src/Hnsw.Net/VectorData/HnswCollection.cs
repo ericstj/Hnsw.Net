@@ -27,7 +27,7 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
     private static readonly VectorSearchOptions<TRecord> s_defaultSearchOptions = new();
 
     private readonly ConcurrentDictionary<string, HnswCollectionData> _collections;
-    private readonly ConcurrentDictionary<string, Type> _collectionTypes;
+    private readonly ConcurrentDictionary<string, (Type Key, Type Record)> _collectionTypes;
     private readonly CollectionModel _model;
     private readonly VectorStoreCollectionMetadata _metadata;
     private readonly DistanceMetric _metric;
@@ -53,7 +53,7 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
     [RequiresDynamicCode("The HNSW connector uses reflection to map records and is incompatible with NativeAOT.")]
     internal HnswCollection(
         ConcurrentDictionary<string, HnswCollectionData>? internalCollections,
-        ConcurrentDictionary<string, Type>? internalCollectionTypes,
+        ConcurrentDictionary<string, (Type Key, Type Record)>? internalCollectionTypes,
         string name,
         HnswCollectionOptions? options)
     {
@@ -95,7 +95,7 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
     {
         if (_collections.TryAdd(Name, new HnswCollectionData()))
         {
-            _collectionTypes.TryAdd(Name, typeof(TRecord));
+            _collectionTypes.TryAdd(Name, (typeof(TKey), typeof(TRecord)));
         }
 
         return Task.CompletedTask;
@@ -633,13 +633,13 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             }
         }
 
-        // Establish/validate the record type before touching _collections so a concurrent GetCollection
-        // with a different TRecord can't slip in and observe mixed-type data for this name.
-        Type existingType = _collectionTypes.GetOrAdd(Name, typeof(TRecord));
-        if (existingType != typeof(TRecord))
+        // Establish/validate the key and record types before touching _collections so a concurrent
+        // GetCollection with a different TKey/TRecord can't slip in and observe mixed-type data for this name.
+        (Type Key, Type Record) existingType = _collectionTypes.GetOrAdd(Name, (typeof(TKey), typeof(TRecord)));
+        if (existingType.Record != typeof(TRecord) || existingType.Key != typeof(TKey))
         {
             throw new InvalidOperationException(
-                $"Collection '{Name}' already exists with data type '{existingType.Name}' and cannot be loaded as data type '{typeof(TRecord).Name}'.");
+                $"Collection '{Name}' already exists with key/data type '{existingType.Key.Name}'/'{existingType.Record.Name}' and cannot be loaded as key/data type '{typeof(TKey).Name}'/'{typeof(TRecord).Name}'.");
         }
 
         // Update the existing per-collection data in place so its Lock object stays stable for any

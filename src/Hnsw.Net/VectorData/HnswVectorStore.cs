@@ -13,7 +13,7 @@ namespace HnswNet;
 public sealed class HnswVectorStore : VectorStore
 {
     private readonly ConcurrentDictionary<string, HnswCollectionData> _collections = new();
-    private readonly ConcurrentDictionary<string, Type> _collectionTypes = new();
+    private readonly ConcurrentDictionary<string, (Type Key, Type Record)> _collectionTypes = new();
     private readonly VectorStoreMetadata _metadata;
     private readonly IEmbeddingGenerator? _embeddingGenerator;
     private readonly int _m;
@@ -46,9 +46,10 @@ public sealed class HnswVectorStore : VectorStore
             throw new ArgumentException("Dynamic records (Dictionary<string, object?>) are not supported by the HNSW connector. Use a strongly-typed record.");
         }
 
-        if (_collectionTypes.TryGetValue(name, out Type? existing) && existing != typeof(TRecord))
+        if (_collectionTypes.TryGetValue(name, out (Type Key, Type Record) existing)
+            && (existing.Record != typeof(TRecord) || existing.Key != typeof(TKey)))
         {
-            throw new InvalidOperationException($"Collection '{name}' already exists with data type '{existing.Name}' and cannot be re-created with data type '{typeof(TRecord).Name}'.");
+            throw new InvalidOperationException($"Collection '{name}' already exists with key/data type '{existing.Key.Name}'/'{existing.Record.Name}' and cannot be re-created with key/data type '{typeof(TKey).Name}'/'{typeof(TRecord).Name}'.");
         }
 
         return new HnswCollection<TKey, TRecord>(
