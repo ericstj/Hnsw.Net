@@ -419,6 +419,30 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         HnswCollectionData data = GetData();
         lock (data.Lock)
         {
+            // Serialize and validate every entry before writing anything, so a type mismatch or an
+            // oversized payload can't leave a partially-written snapshot on the destination stream.
+            var serialized = new List<(long Id, byte[] Key, byte[] Record)>(data.Records.Count);
+            foreach (KeyValuePair<object, HnswCollectionData.Entry> kvp in data.Records)
+            {
+                if (kvp.Key is not TKey typedKey || kvp.Value.Record is not TRecord typedRecord)
+                {
+                    throw new InvalidOperationException(
+                        $"Collection '{Name}' contains an entry whose key or record type does not match " +
+                        $"the '{typeof(TKey).Name}'/'{typeof(TRecord).Name}' used to save it. The same collection " +
+                        "name must always be accessed with a single key and record type.");
+                }
+
+                byte[] keyJson = serializeKey(typedKey);
+                byte[] recordJson = serializeRecord(typedRecord);
+                if (keyJson.Length > MaxPayloadLength || recordJson.Length > MaxPayloadLength)
+                {
+                    throw new InvalidOperationException(
+                        $"A serialized key or record exceeds the maximum supported snapshot payload size ({MaxPayloadLength} bytes).");
+                }
+
+                serialized.Add((kvp.Value.Id, keyJson, recordJson));
+            }
+
             using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
             {
                 writer.Write(SnapshotMagic);
@@ -426,26 +450,10 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                 writer.Write(data.Dimension);
                 writer.Write((int)_metric);
                 writer.Write(data.NextId);
-                writer.Write(data.Records.Count);
-                foreach (KeyValuePair<object, HnswCollectionData.Entry> kvp in data.Records)
+                writer.Write(serialized.Count);
+                foreach ((long id, byte[] keyJson, byte[] recordJson) in serialized)
                 {
-                    if (kvp.Key is not TKey typedKey || kvp.Value.Record is not TRecord typedRecord)
-                    {
-                        throw new InvalidOperationException(
-                            $"Collection '{Name}' contains an entry whose key or record type does not match " +
-                            $"the '{typeof(TKey).Name}'/'{typeof(TRecord).Name}' used to save it. The same collection " +
-                            "name must always be accessed with a single key and record type.");
-                    }
-
-                    byte[] keyJson = serializeKey(typedKey);
-                    byte[] recordJson = serializeRecord(typedRecord);
-                    if (keyJson.Length > MaxPayloadLength || recordJson.Length > MaxPayloadLength)
-                    {
-                        throw new InvalidOperationException(
-                            $"A serialized key or record exceeds the maximum supported snapshot payload size ({MaxPayloadLength} bytes).");
-                    }
-
-                    writer.Write(kvp.Value.Id);
+                    writer.Write(id);
                     writer.Write(keyJson.Length);
                     writer.Write(keyJson);
                     writer.Write(recordJson.Length);
@@ -529,6 +537,14 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             {
                 throw new InvalidDataException("Truncated Hnsw.Net collection snapshot.", ex);
             }
+            catch (JsonException ex)
+            {
+                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: a key or record payload is not valid JSON.", ex);
+            }
+            catch (NotSupportedException ex)
+            {
+                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: a key or record payload could not be deserialized.", ex);
+            }
         }
 
         if (entries.Count > 0 && !hasIndex)
@@ -543,7 +559,19 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                 "Corrupt Hnsw.Net collection snapshot: an index is present but the vector dimension is zero.");
         }
 
-        HnswIndex? index = hasIndex ? HnswIndex.Load(stream) : null;
+        HnswIndex? index;
+        try
+        {
+            index = hasIndex ? HnswIndex.Load(stream) : null;
+        }
+        catch (Exception ex) when (
+            ex is EndOfStreamException or IOException or OverflowException
+                or ArgumentException or InvalidOperationException or FormatException
+            && ex is not InvalidDataException)
+        {
+            throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: the index is invalid.", ex);
+        }
+
         if (index is not null && (index.Dimension != dimension || index.Metric != metric))
         {
             throw new InvalidDataException(

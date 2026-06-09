@@ -302,6 +302,30 @@ public partial class VectorStoreTests
     }
 
     [Fact]
+    public async Task Load_CorruptIndexRegion_ThrowsInvalidData()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        int indexStart = HasIndexOffset(bytes) + 1; // skip the hasIndex byte
+        // The index 'count' field sits 36 bytes into the index header; a value whose product with the
+        // dimension overflows Int32 makes HnswIndex.Load throw OverflowException, which Load must normalize.
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(indexStart + 36), 1_000_000_000);
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_MalformedJsonPayload_ThrowsInvalidData()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        // First key JSON starts after the 28-byte header + 8-byte id + 4-byte length prefix.
+        bytes[40] = (byte)'}'; // make the first key payload invalid JSON
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
     public async Task Load_TruncatedHeader_ThrowsInvalidData()
     {
         byte[] bytes = await SaveSnapshotAsync();
