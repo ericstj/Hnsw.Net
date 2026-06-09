@@ -18,7 +18,7 @@ public partial class VectorStoreTests
                 collection.Save(fs, SnapshotContext.Default);
             }
 
-            var store = new HnswVectorStore();
+            using var store = new HnswVectorStore();
             HnswCollection<int, Doc> reloaded = store.GetCollection<int, Doc>("docs");
             reloaded.Load(path, SnapshotContext.Default);
 
@@ -35,14 +35,10 @@ public partial class VectorStoreTests
 
             Assert.Equal(3, results.Count);
             Assert.Equal(1, results[0].Record.Id);
-
-            // Disposing the store must release the mapping so the file can be deleted (Windows locks maps).
-            store.Dispose();
-            File.Delete(path);
-            Assert.False(File.Exists(path));
         }
         finally
         {
+            // store is disposed by `using` above, releasing the mapping so the file can be deleted (Windows locks maps).
             if (File.Exists(path))
             {
                 File.Delete(path);
@@ -116,7 +112,7 @@ public partial class VectorStoreTests
                 collection.Save(fs, SnapshotContext.Default);
             }
 
-            var streamStore = new HnswVectorStore();
+            using var streamStore = new HnswVectorStore();
             HnswCollection<int, Doc> streamLoaded = streamStore.GetCollection<int, Doc>("docs");
             using (FileStream fs = File.OpenRead(path))
             {
@@ -129,7 +125,6 @@ public partial class VectorStoreTests
 
             float[] query = { 0f, 0.2f, 0.9f };
             Assert.Equal(await CollectIdsAsync(streamLoaded, query), await CollectIdsAsync(mapLoaded, query));
-            streamStore.Dispose();
         }
         finally
         {

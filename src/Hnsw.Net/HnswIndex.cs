@@ -32,6 +32,7 @@ public sealed class HnswIndex : IDisposable
     private readonly ConcurrentBag<Scratch> _scratchPool = new();
     private readonly Comparison<Candidate> _candidateComparison;
     private VectorBlock _vectors;
+    private bool _disposed;
 
     /// <summary>Initializes a new HNSW index.</summary>
     /// <param name="dimension">Vector dimension. All indexed and query vectors must have this length.</param>
@@ -180,10 +181,7 @@ public sealed class HnswIndex : IDisposable
     public void Add(long id, ReadOnlySpan<float> vector)
     {
         ValidateVector(vector);
-        if (_vectors.IsReadOnly)
-        {
-            throw new InvalidOperationException("This index was loaded with memory-mapped vectors and is read-only. Load it without mapping to modify it.");
-        }
+        ThrowIfReadOnly();
 
         _lock.EnterWriteLock();
         try
@@ -249,6 +247,7 @@ public sealed class HnswIndex : IDisposable
     /// </summary>
     public void MarkDeleted(long id)
     {
+        ThrowIfReadOnly();
         _lock.EnterWriteLock();
         try
         {
@@ -279,6 +278,7 @@ public sealed class HnswIndex : IDisposable
     /// <summary>Restores a vector previously marked by <see cref="MarkDeleted" />, making it searchable again.</summary>
     public void UnmarkDeleted(long id)
     {
+        ThrowIfReadOnly();
         _lock.EnterWriteLock();
         try
         {
@@ -606,7 +606,26 @@ public sealed class HnswIndex : IDisposable
             }
 
             vectorOffset = stream.Position;
-            long vectorBytes = (long)header.Count * header.Dimension * sizeof(float);
+            if (header.Count < 0 || header.Dimension < 0)
+            {
+                throw new InvalidDataException("The index header specifies a negative count or dimension.");
+            }
+
+            long vectorBytes;
+            try
+            {
+                vectorBytes = checked((long)header.Count * header.Dimension * sizeof(float));
+            }
+            catch (OverflowException)
+            {
+                throw new InvalidDataException("The index vector section size is invalid.");
+            }
+
+            if (vectorOffset + vectorBytes > stream.Length)
+            {
+                throw new InvalidDataException("The index vector section extends beyond the end of the file.");
+            }
+
             index = new HnswIndex(header.Dimension, header.Metric, header.M, header.EfConstruction, header.Ef, header.EntryPoint, header.MaxLevel, header.AllowReplaceDeleted);
 
             stream.Seek(vectorOffset + vectorBytes, SeekOrigin.Begin);
@@ -745,8 +764,22 @@ public sealed class HnswIndex : IDisposable
     /// <summary>Releases the memory mapping held by an index loaded via <see cref="LoadMapped(string)" />.</summary>
     public void Dispose()
     {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
         (_vectors as IDisposable)?.Dispose();
         _lock.Dispose();
+    }
+
+    private void ThrowIfReadOnly()
+    {
+        if (_vectors.IsReadOnly)
+        {
+            throw new InvalidOperationException("This index was loaded with memory-mapped vectors and is read-only. Load it without mapping to modify it.");
+        }
     }
 
     private void ValidateVector(ReadOnlySpan<float> vector)

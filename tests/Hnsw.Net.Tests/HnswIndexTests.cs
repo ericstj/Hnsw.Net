@@ -105,6 +105,12 @@ public sealed class HnswIndexTests
                 Assert.True(mapped.TryGetVector(10_000, out float[] stored));
                 Assert.Equal(Normalize(vectors[0]), stored);
                 Assert.Throws<InvalidOperationException>(() => mapped.Add(99_999, vectors[0]));
+                Assert.Throws<InvalidOperationException>(() => mapped.MarkDeleted(10_000));
+                Assert.Throws<InvalidOperationException>(() => mapped.UnmarkDeleted(10_000));
+
+                // Dispose must be idempotent (ReaderWriterLockSlim cannot be disposed twice).
+                mapped.Dispose();
+                mapped.Dispose();
             }
 
             // Dispose must release the mapping so the file is no longer locked.

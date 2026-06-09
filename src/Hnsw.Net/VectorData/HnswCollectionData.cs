@@ -31,8 +31,13 @@ internal sealed class HnswCollectionData : IDisposable
 
     public void Dispose()
     {
-        Index?.Dispose();
-        MappedRecords?.Dispose();
+        lock (Lock)
+        {
+            Index?.Dispose();
+            MappedRecords?.Dispose();
+            Index = null;
+            MappedRecords = null;
+        }
     }
 
     /// <summary>
