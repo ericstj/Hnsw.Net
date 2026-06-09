@@ -102,6 +102,8 @@ use the overloads that take a source-generated `JsonSerializerContext` so record
 serialize without runtime reflection:
 
 ```csharp
+using System.Text.Json.Serialization;
+
 [JsonSerializable(typeof(Doc))]
 [JsonSerializable(typeof(int))]
 partial class StoreContext : JsonSerializerContext { }

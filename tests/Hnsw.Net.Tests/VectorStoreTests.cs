@@ -238,6 +238,45 @@ public partial class VectorStoreTests
         Assert.Throws<InvalidDataException>(() => mismatched.Load(ms));
     }
 
+    [Theory]
+    [InlineData(8, -1)]   // dimension field
+    public async Task Load_NegativeHeaderInt32_Throws(int offset, int value)
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BitConverter.GetBytes(value).CopyTo(bytes, offset);
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_NegativeNextId_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BitConverter.GetBytes(-1L).CopyTo(bytes, 16); // nextId field
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_NextIdNotGreaterThanRecordIds_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BitConverter.GetBytes(0L).CopyTo(bytes, 16); // nextId <= existing record ids
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    private static async Task<byte[]> SaveSnapshotAsync()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var ms = new MemoryStream();
+        collection.Save(ms);
+        return ms.ToArray();
+    }
+
     private sealed class StringDoc
     {
         [VectorStoreKey]

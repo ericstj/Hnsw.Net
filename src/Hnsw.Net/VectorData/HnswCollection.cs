@@ -470,6 +470,16 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             metric = (DistanceMetric)reader.ReadInt32();
             nextId = reader.ReadInt64();
 
+            if (dimension < 0)
+            {
+                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative vector dimension.");
+            }
+
+            if (nextId < 0)
+            {
+                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative next id.");
+            }
+
             int configured = _model.VectorProperty.Dimensions;
             if (configured > 0 && dimension > 0 && dimension != configured)
             {
@@ -508,6 +518,37 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                 $"does not match the snapshot header (dimension {dimension}, metric {metric}).");
         }
 
+        // Build and fully validate the new state before touching the live collection, so a corrupt
+        // snapshot leaves the existing contents intact rather than partially overwritten.
+        var newRecords = new Dictionary<object, HnswCollectionData.Entry>();
+        var newIdToKey = new Dictionary<long, TKey>();
+        foreach ((TKey key, long id, TRecord record) in entries)
+        {
+            if (id >= nextId)
+            {
+                throw new InvalidDataException(
+                    $"Corrupt Hnsw.Net collection snapshot: record id {id} is not less than the next id ({nextId}).");
+            }
+
+            ReadOnlyMemory<float> vector;
+            if (index is null)
+            {
+                vector = ReadOnlyMemory<float>.Empty;
+            }
+            else if (index.TryGetVector(id, out float[] v))
+            {
+                vector = v;
+            }
+            else
+            {
+                throw new InvalidDataException(
+                    $"Corrupt Hnsw.Net collection snapshot: the index does not contain a vector for record id {id}.");
+            }
+
+            newRecords[key!] = new HnswCollectionData.Entry { Record = record!, Id = id, Vector = vector };
+            newIdToKey[id] = key!;
+        }
+
         // Update the existing per-collection data in place so its Lock object stays stable for any
         // other threads that already captured it via GetData().
         HnswCollectionData data = _collections.GetOrAdd(Name, static _ => new HnswCollectionData());
@@ -518,24 +559,13 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             data.Dimension = dimension;
             data.NextId = nextId;
             data.Index = index;
-            foreach ((TKey key, long id, TRecord record) in entries)
+            foreach ((object key, HnswCollectionData.Entry entry) in newRecords)
             {
-                ReadOnlyMemory<float> vector;
-                if (index is null)
-                {
-                    vector = ReadOnlyMemory<float>.Empty;
-                }
-                else if (index.TryGetVector(id, out float[] v))
-                {
-                    vector = v;
-                }
-                else
-                {
-                    throw new InvalidDataException(
-                        $"Corrupt Hnsw.Net collection snapshot: the index does not contain a vector for record id {id}.");
-                }
+                data.Records[key] = entry;
+            }
 
-                data.Records[key!] = new HnswCollectionData.Entry { Record = record!, Id = id, Vector = vector };
+            foreach ((long id, TKey key) in newIdToKey)
+            {
                 data.IdToKey[id] = key!;
             }
         }
