@@ -29,7 +29,7 @@ public sealed class HnswIndex
     private readonly ReaderWriterLockSlim _lock = new();
     private readonly ConcurrentBag<Scratch> _scratchPool = new();
     private readonly Comparison<Candidate> _candidateComparison;
-    private float[] _storedVectors = Array.Empty<float>();
+    private VectorBlock _vectors;
 
     /// <summary>Initializes a new HNSW index.</summary>
     /// <param name="dimension">Vector dimension. All indexed and query vectors must have this length.</param>
@@ -62,6 +62,7 @@ public sealed class HnswIndex
         _levelMultiplier = 1.0 / Math.Log(m);
         _allowReplaceDeleted = allowReplaceDeleted;
         _candidateComparison = CompareCandidates;
+        _vectors = new VectorBlock(dimension);
     }
 
     private HnswIndex(int dimension, DistanceMetric metric, int m, int efConstruction, int ef, int entryPoint, int maxLevel, bool allowReplaceDeleted)
@@ -77,6 +78,7 @@ public sealed class HnswIndex
         _levelMultiplier = 1.0 / Math.Log(m);
         _allowReplaceDeleted = allowReplaceDeleted;
         _candidateComparison = CompareCandidates;
+        _vectors = new VectorBlock(dimension);
     }
 
     /// <summary>Gets the vector dimension.</summary>
@@ -542,14 +544,14 @@ public sealed class HnswIndex
         int count = reader.ReadInt32();
         bool allowReplaceDeleted = version >= 3 && reader.ReadBoolean();
         var index = new HnswIndex(dimension, metric, m, efConstruction, ef, entryPoint, maxLevel, allowReplaceDeleted);
-        index._storedVectors = count > 0 ? new float[count * dimension] : Array.Empty<float>();
+        index._vectors.EnsureCapacity(count);
 
         for (int i = 0; i < count; i++)
         {
             long id = reader.ReadInt64();
             int level = reader.ReadInt32();
             bool deleted = version >= 3 && reader.ReadBoolean();
-            Span<float> stored = index._storedVectors.AsSpan(i * dimension, dimension);
+            Span<float> stored = index._vectors.VectorMutable(i);
             ReadExactInto(reader, MemoryMarshal.AsBytes(stored));
             var originalVector = new float[dimension];
             if (version >= 2)
@@ -628,24 +630,9 @@ public sealed class HnswIndex
         }
     }
 
-    private void EnsureStoredCapacity(int nodeCount)
-    {
-        int required = nodeCount * Dimension;
-        if (_storedVectors.Length >= required)
-        {
-            return;
-        }
+    private void EnsureStoredCapacity(int nodeCount) => _vectors.EnsureCapacity(nodeCount);
 
-        int capacity = _storedVectors.Length == 0 ? Dimension * 16 : _storedVectors.Length * 2;
-        if (capacity < required)
-        {
-            capacity = required;
-        }
-
-        Array.Resize(ref _storedVectors, capacity);
-    }
-
-    private ReadOnlySpan<float> StoredSpan(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
+    private ReadOnlySpan<float> StoredSpan(int index) => _vectors.Vector(index);
 
     // Per-slot read accessors. The search path goes through these so the backing storage can later
     // be swapped (e.g. a memory-mapped level-0 block) without touching the algorithms.
@@ -653,7 +640,7 @@ public sealed class HnswIndex
 
     private List<int> SlotLinks(int slot, int layer) => _nodes[slot].Links[layer];
 
-    private Span<float> StoredSpanMutable(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
+    private Span<float> StoredSpanMutable(int index) => _vectors.VectorMutable(index);
 
     private static void ReadExactInto(BinaryReader reader, Span<byte> buffer)
     {
@@ -878,6 +865,49 @@ public sealed class HnswIndex
         }
 
         return sum;
+    }
+
+    // Chunked, slot-addressed storage for the normalized search vectors. Splitting the data into
+    // bounded chunks keeps each backing array well under the .NET array length limit so the index
+    // scales to very large repos, and gives every slot a contiguous span ready for a future
+    // memory-mapped backing.
+    private sealed class VectorBlock
+    {
+        private readonly int _dimension;
+        private readonly int _vectorsPerChunk;
+        private readonly List<float[]> _chunks = new();
+        private int _capacity;
+
+        public VectorBlock(int dimension)
+        {
+            _dimension = dimension;
+
+            // Target ~256 MB (64Mi floats) per chunk, at least one vector, and never let a chunk's
+            // element count exceed the int array bound.
+            const long TargetFloatsPerChunk = 64L * 1024 * 1024;
+            long perChunk = Math.Max(1, TargetFloatsPerChunk / dimension);
+            _vectorsPerChunk = (int)Math.Min(perChunk, int.MaxValue / dimension);
+        }
+
+        public void EnsureCapacity(int slotCount)
+        {
+            while (_capacity < slotCount)
+            {
+                _chunks.Add(new float[_vectorsPerChunk * _dimension]);
+                _capacity += _vectorsPerChunk;
+            }
+        }
+
+        public ReadOnlySpan<float> Vector(int slot) => Slot(slot);
+
+        public Span<float> VectorMutable(int slot) => Slot(slot);
+
+        private Span<float> Slot(int slot)
+        {
+            int chunk = slot / _vectorsPerChunk;
+            int offset = (slot % _vectorsPerChunk) * _dimension;
+            return _chunks[chunk].AsSpan(offset, _dimension);
+        }
     }
 
     private sealed class Node
