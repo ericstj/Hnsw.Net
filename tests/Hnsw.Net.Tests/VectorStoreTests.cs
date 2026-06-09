@@ -1,11 +1,13 @@
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.VectorData;
+using System.Buffers.Binary;
+using System.Text.Json.Serialization;
 using HnswNet;
 using Xunit;
 
 namespace Hnsw.Net.Tests;
 
-public class VectorStoreTests
+public partial class VectorStoreTests
 {
     private sealed class Doc
     {
@@ -114,6 +116,301 @@ public class VectorStoreTests
 
         Assert.Equal("moved", (await collection.GetAsync(1))!.Text);
         Assert.Contains(results, r => r.Record.Id == 1);
+    }
+
+    [Fact]
+    public async Task SaveLoad_RoundTripsRecordsAndSearch()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+
+        using var ms = new MemoryStream();
+        collection.Save(ms);
+        ms.Position = 0;
+
+        var reloaded = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        reloaded.Load(ms);
+
+        Doc? fetched = await reloaded.GetAsync(2);
+        Assert.NotNull(fetched);
+        Assert.Equal("y axis", fetched!.Text);
+
+        List<VectorSearchResult<Doc>> results = new();
+        await foreach (VectorSearchResult<Doc> r in reloaded.SearchAsync(new float[] { 0.9f, 0.1f, 0f }, top: 3))
+        {
+            results.Add(r);
+        }
+
+        Assert.Equal(3, results.Count);
+        Assert.Equal(1, results[0].Record.Id);
+    }
+
+    [JsonSerializable(typeof(Doc))]
+    [JsonSerializable(typeof(int))]
+    private partial class SnapshotContext : JsonSerializerContext { }
+
+    [Fact]
+    public async Task SaveLoad_WithJsonContext_RoundTripsRecordsAndSearch()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+
+        using var ms = new MemoryStream();
+        collection.Save(ms, SnapshotContext.Default);
+        ms.Position = 0;
+
+        var reloaded = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        reloaded.Load(ms, SnapshotContext.Default);
+
+        Doc? fetched = await reloaded.GetAsync(2);
+        Assert.NotNull(fetched);
+        Assert.Equal("y axis", fetched!.Text);
+
+        List<VectorSearchResult<Doc>> results = new();
+        await foreach (VectorSearchResult<Doc> r in reloaded.SearchAsync(new float[] { 0.9f, 0.1f, 0f }, top: 3))
+        {
+            results.Add(r);
+        }
+
+        Assert.Equal(3, results.Count);
+        Assert.Equal(1, results[0].Record.Id);
+    }
+
+    [Fact]
+    public async Task Save_WithJsonContext_LoadableByReflection()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+
+        using var ms = new MemoryStream();
+        collection.Save(ms, SnapshotContext.Default);
+        ms.Position = 0;
+
+        var reloaded = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        reloaded.Load(ms);
+
+        Doc? fetched = await reloaded.GetAsync(3);
+        Assert.NotNull(fetched);
+        Assert.Equal("z axis", fetched!.Text);
+    }
+
+    [Fact]
+    public async Task Load_DimensionMismatch_Throws()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var ms = new MemoryStream();
+        collection.Save(ms);
+        ms.Position = 0;
+
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            {
+                new VectorStoreKeyProperty(nameof(Doc.Id), typeof(int)),
+                new VectorStoreVectorProperty(nameof(Doc.Vector), typeof(ReadOnlyMemory<float>), 5)
+                {
+                    DistanceFunction = DistanceFunction.CosineSimilarity,
+                },
+            },
+        };
+        var mismatched = new HnswVectorStore().GetCollection<int, Doc>("docs", definition);
+
+        Assert.Throws<InvalidDataException>(() => mismatched.Load(ms));
+    }
+
+    [Fact]
+    public async Task Load_MetricMismatch_Throws()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var ms = new MemoryStream();
+        collection.Save(ms);
+        ms.Position = 0;
+
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            {
+                new VectorStoreKeyProperty(nameof(Doc.Id), typeof(int)),
+                new VectorStoreVectorProperty(nameof(Doc.Vector), typeof(ReadOnlyMemory<float>), 3)
+                {
+                    DistanceFunction = DistanceFunction.EuclideanDistance,
+                },
+            },
+        };
+        var mismatched = new HnswVectorStore().GetCollection<int, Doc>("docs", definition);
+
+        Assert.Throws<InvalidDataException>(() => mismatched.Load(ms));
+    }
+
+    [Theory]
+    [InlineData(8, -1)]   // dimension field
+    public async Task Load_NegativeHeaderInt32_Throws(int offset, int value)
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(offset), value);
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_NegativeNextId_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(16), -1L); // nextId field
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_NegativeRecordId_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(28), -1L); // first record id
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_NextIdNotGreaterThanRecordIds_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(16), 0L); // nextId <= existing record ids
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_NonEmptyWithoutIndex_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        bytes[HasIndexOffset(bytes)] = 0; // clear hasIndex on a non-empty snapshot
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_DuplicateRecordId_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        long firstId = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(28));
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(SecondRecordOffset(bytes)), firstId);
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_IndexWithZeroDimension_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(8), 0); // dimension field, snapshot has an index
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Save_NonWritableStream_Throws()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var readOnly = new MemoryStream(Array.Empty<byte>(), writable: false);
+        Assert.Throws<ArgumentException>(() => collection.Save(readOnly));
+    }
+
+    [Fact]
+    public async Task Load_NonReadableStream_Throws()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var writeOnly = new WriteOnlyStream();
+        Assert.Throws<ArgumentException>(() => collection.Load(writeOnly));
+    }
+
+    private sealed class WriteOnlyStream : Stream
+    {
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => 0;
+        public override long Position { get => 0; set { } }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) { }
+        public override void Write(byte[] buffer, int offset, int count) { }
+    }
+
+    [Fact]
+    public async Task Load_CorruptIndexRegion_ThrowsInvalidData()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        int indexStart = HasIndexOffset(bytes) + 1; // skip the hasIndex byte
+        // The index 'count' field sits 36 bytes into the index header; a value whose product with the
+        // dimension overflows Int32 makes HnswIndex.Load throw OverflowException, which Load must normalize.
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(indexStart + 36), 1_000_000_000);
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_MalformedJsonPayload_ThrowsInvalidData()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        // First key JSON starts after the 28-byte header + 8-byte id + 4-byte length prefix.
+        bytes[40] = (byte)'}'; // make the first key payload invalid JSON
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_TruncatedHeader_ThrowsInvalidData()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        byte[] truncated = bytes[..10]; // cut off mid-header
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(truncated)));
+    }
+
+    // Walks the fixed 28-byte header and per-record framing to locate the trailing hasIndex byte.
+    private static int HasIndexOffset(byte[] bytes)
+    {
+        int pos = 24;
+        int count = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+        pos += 4;
+        for (int i = 0; i < count; i++)
+        {
+            pos += 8; // id
+            int keyLen = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+            pos += 4 + keyLen;
+            int recLen = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+            pos += 4 + recLen;
+        }
+
+        return pos;
+    }
+
+    // Offset of the second record's id field (records start at byte 28).
+    private static int SecondRecordOffset(byte[] bytes)
+    {
+        int pos = 28;
+        pos += 8; // first record id
+        int keyLen = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+        pos += 4 + keyLen;
+        int recLen = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+        pos += 4 + recLen;
+        return pos;
+    }
+
+    private static async Task<byte[]> SaveSnapshotAsync()
+    {
+        HnswCollection<int, Doc> collection = await SeedAsync();
+        using var ms = new MemoryStream();
+        collection.Save(ms);
+        return ms.ToArray();
     }
 
     private sealed class StringDoc
