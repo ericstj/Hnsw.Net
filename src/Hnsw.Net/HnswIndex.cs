@@ -606,11 +606,6 @@ public sealed class HnswIndex : IDisposable
             }
 
             vectorOffset = stream.Position;
-            if (header.Count < 0 || header.Dimension < 0)
-            {
-                throw new InvalidDataException("The index header specifies a negative count or dimension.");
-            }
-
             long vectorBytes;
             try
             {
@@ -651,6 +646,7 @@ public sealed class HnswIndex : IDisposable
         {
             view?.Dispose();
             file?.Dispose();
+            index.Dispose();
             throw;
         }
     }
@@ -677,6 +673,16 @@ public sealed class HnswIndex : IDisposable
         int maxLevel = reader.ReadInt32();
         int count = reader.ReadInt32();
         bool allowReplaceDeleted = version >= 3 && reader.ReadBoolean();
+        if (dimension <= 0)
+        {
+            throw new InvalidDataException("The index header specifies a non-positive dimension.");
+        }
+
+        if (count < 0)
+        {
+            throw new InvalidDataException("The index header specifies a negative count.");
+        }
+
         return new Header(version, dimension, metric, m, efConstruction, ef, entryPoint, maxLevel, count, allowReplaceDeleted);
     }
 

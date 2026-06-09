@@ -260,6 +260,24 @@ public sealed class HnswIndexTests
         }
     }
 
+    [Fact]
+    public void RejectsNonPositiveDimensionOnLoad()
+    {
+        byte[] payload = BuildV4StreamWithLink(neighbor: 0, count: 0, dimension: 0);
+        Assert.Throws<InvalidDataException>(() => HnswIndex.Load(new MemoryStream(payload)));
+
+        string path = Path.Combine(Path.GetTempPath(), $"hnsw_dim0_{Guid.NewGuid():N}.bin");
+        try
+        {
+            File.WriteAllBytes(path, payload);
+            Assert.Throws<InvalidDataException>(() => HnswIndex.LoadMapped(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
     // Hand-craft a current-format (v4) stream of `count` zero vectors where the first node carries a
     // single layer-0 link to `neighbor`, used to verify out-of-range links are rejected at load.
     private static byte[] BuildV4StreamWithLink(int neighbor, int count, int dimension)
