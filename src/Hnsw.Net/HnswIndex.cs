@@ -439,7 +439,7 @@ public sealed class HnswIndex
             try
             {
                 int entryPoint = _entryPoint;
-                float entryDistance = Distance(preparedQuery, StoredSpan(entryPoint));
+                float entryDistance = Distance(preparedQuery, SlotVector(entryPoint));
                 for (int layer = _maxLevel; layer > 0; layer--)
                 {
                     (entryPoint, entryDistance) = SearchGreedy(preparedQuery, entryPoint, entryDistance, layer);
@@ -647,6 +647,12 @@ public sealed class HnswIndex
 
     private ReadOnlySpan<float> StoredSpan(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
 
+    // Per-slot read accessors. The search path goes through these so the backing storage can later
+    // be swapped (e.g. a memory-mapped level-0 block) without touching the algorithms.
+    private ReadOnlySpan<float> SlotVector(int slot) => StoredSpan(slot);
+
+    private List<int> SlotLinks(int slot, int layer) => _nodes[slot].Links[layer];
+
     private Span<float> StoredSpanMutable(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
 
     private static void ReadExactInto(BinaryReader reader, Span<byte> buffer)
@@ -676,9 +682,9 @@ public sealed class HnswIndex
         do
         {
             changed = false;
-            foreach (int neighbor in _nodes[entryPoint].Links[layer])
+            foreach (int neighbor in SlotLinks(entryPoint, layer))
             {
-                float distance = Distance(query, StoredSpan(neighbor));
+                float distance = Distance(query, SlotVector(neighbor));
                 if (distance < entryDistance)
                 {
                     entryDistance = distance;
@@ -699,7 +705,7 @@ public sealed class HnswIndex
         s.Nearest.Clear();
         s.Visited[entryPoint] = version;
 
-        float entryDistance = Distance(query, StoredSpan(entryPoint));
+        float entryDistance = Distance(query, SlotVector(entryPoint));
         var entry = new Candidate(entryPoint, entryDistance);
         s.Candidates.Enqueue(entry, entryDistance);
         float lowerBound;
@@ -721,7 +727,7 @@ public sealed class HnswIndex
                 break;
             }
 
-            foreach (int neighbor in _nodes[current.Index].Links[layer])
+            foreach (int neighbor in SlotLinks(current.Index, layer))
             {
                 if (s.Visited[neighbor] == version)
                 {
@@ -729,7 +735,7 @@ public sealed class HnswIndex
                 }
 
                 s.Visited[neighbor] = version;
-                float distance = Distance(query, StoredSpan(neighbor));
+                float distance = Distance(query, SlotVector(neighbor));
                 if (s.Nearest.Count < ef || distance < lowerBound)
                 {
                     var candidate = new Candidate(neighbor, distance);
@@ -768,11 +774,11 @@ public sealed class HnswIndex
         candidates.Sort(_candidateComparison);
         foreach (Candidate candidate in candidates)
         {
-            ReadOnlySpan<float> candidateSpan = StoredSpan(candidate.Index);
+            ReadOnlySpan<float> candidateSpan = SlotVector(candidate.Index);
             bool good = true;
             foreach (int selected in result)
             {
-                if (Distance(candidateSpan, StoredSpan(selected)) < candidate.Distance)
+                if (Distance(candidateSpan, SlotVector(selected)) < candidate.Distance)
                 {
                     good = false;
                     break;
