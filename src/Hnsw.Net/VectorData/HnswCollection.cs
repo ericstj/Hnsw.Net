@@ -470,58 +470,65 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         var entries = new List<(TKey Key, long Id, TRecord Record)>();
         using (var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true))
         {
-            if (reader.ReadUInt32() != SnapshotMagic)
+            try
             {
-                throw new InvalidDataException("The stream is not an Hnsw.Net collection snapshot.");
-            }
+                if (reader.ReadUInt32() != SnapshotMagic)
+                {
+                    throw new InvalidDataException("The stream is not an Hnsw.Net collection snapshot.");
+                }
 
-            if (reader.ReadInt32() != SnapshotVersion)
+                if (reader.ReadInt32() != SnapshotVersion)
+                {
+                    throw new InvalidDataException("Unsupported Hnsw.Net collection snapshot version.");
+                }
+
+                dimension = reader.ReadInt32();
+                metric = (DistanceMetric)reader.ReadInt32();
+                nextId = reader.ReadInt64();
+
+                if (dimension < 0)
+                {
+                    throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative vector dimension.");
+                }
+
+                if (nextId < 0)
+                {
+                    throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative next id.");
+                }
+
+                int configured = _model.VectorProperty.Dimensions;
+                if (configured > 0 && dimension > 0 && dimension != configured)
+                {
+                    throw new InvalidDataException(
+                        $"The snapshot's vector dimension ({dimension}) does not match the collection's configured dimension ({configured}).");
+                }
+
+                if (metric != _metric)
+                {
+                    throw new InvalidDataException(
+                        $"The snapshot's distance metric ({metric}) does not match the collection's configured metric ({_metric}).");
+                }
+
+                int count = reader.ReadInt32();
+                if (count < 0)
+                {
+                    throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative record count.");
+                }
+
+                for (int i = 0; i < count; i++)
+                {
+                    long id = reader.ReadInt64();
+                    byte[] keyJson = ReadExact(reader, reader.ReadInt32());
+                    byte[] recordJson = ReadExact(reader, reader.ReadInt32());
+                    entries.Add((deserializeKey(keyJson), id, deserializeRecord(recordJson)));
+                }
+
+                hasIndex = reader.ReadBoolean();
+            }
+            catch (EndOfStreamException ex)
             {
-                throw new InvalidDataException("Unsupported Hnsw.Net collection snapshot version.");
+                throw new InvalidDataException("Truncated Hnsw.Net collection snapshot.", ex);
             }
-
-            dimension = reader.ReadInt32();
-            metric = (DistanceMetric)reader.ReadInt32();
-            nextId = reader.ReadInt64();
-
-            if (dimension < 0)
-            {
-                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative vector dimension.");
-            }
-
-            if (nextId < 0)
-            {
-                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative next id.");
-            }
-
-            int configured = _model.VectorProperty.Dimensions;
-            if (configured > 0 && dimension > 0 && dimension != configured)
-            {
-                throw new InvalidDataException(
-                    $"The snapshot's vector dimension ({dimension}) does not match the collection's configured dimension ({configured}).");
-            }
-
-            if (metric != _metric)
-            {
-                throw new InvalidDataException(
-                    $"The snapshot's distance metric ({metric}) does not match the collection's configured metric ({_metric}).");
-            }
-
-            int count = reader.ReadInt32();
-            if (count < 0)
-            {
-                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative record count.");
-            }
-
-            for (int i = 0; i < count; i++)
-            {
-                long id = reader.ReadInt64();
-                byte[] keyJson = ReadExact(reader, reader.ReadInt32());
-                byte[] recordJson = ReadExact(reader, reader.ReadInt32());
-                entries.Add((deserializeKey(keyJson), id, deserializeRecord(recordJson)));
-            }
-
-            hasIndex = reader.ReadBoolean();
         }
 
         if (entries.Count > 0 && !hasIndex)

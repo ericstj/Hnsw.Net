@@ -301,6 +301,16 @@ public partial class VectorStoreTests
         Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
     }
 
+    [Fact]
+    public async Task Load_TruncatedHeader_ThrowsInvalidData()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        byte[] truncated = bytes[..10]; // cut off mid-header
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(truncated)));
+    }
+
     // Walks the fixed 28-byte header and per-record framing to locate the trailing hasIndex byte.
     private static int HasIndexOffset(byte[] bytes)
     {
