@@ -236,6 +236,72 @@ public sealed class HnswIndexTests
     }
 
     [Fact]
+    public void RejectsOutOfRangeLinkIndexOnLoad()
+    {
+        byte[] payload = BuildV4StreamWithLink(neighbor: 5, count: 2, dimension: 3);
+
+        Assert.Throws<InvalidDataException>(() => HnswIndex.Load(new MemoryStream(payload)));
+
+        string path = Path.Combine(Path.GetTempPath(), $"hnsw_corrupt_{Guid.NewGuid():N}.bin");
+        try
+        {
+            File.WriteAllBytes(path, payload);
+            Assert.Throws<InvalidDataException>(() => HnswIndex.LoadMapped(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    // Hand-craft a current-format (v4) stream of `count` zero vectors where the first node carries a
+    // single layer-0 link to `neighbor`, used to verify out-of-range links are rejected at load.
+    private static byte[] BuildV4StreamWithLink(int neighbor, int count, int dimension)
+    {
+        const uint magic = 0x31575348;
+        const int version = 4;
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write(magic);
+            writer.Write(version);
+            writer.Write(dimension);
+            writer.Write((int)DistanceMetric.DotProduct);
+            writer.Write(2);                                 // m
+            writer.Write(10);                                // efConstruction
+            writer.Write(10);                                // ef
+            writer.Write(0);                                 // entryPoint
+            writer.Write(0);                                 // maxLevel
+            writer.Write(count);
+            writer.Write(false);                             // allowReplaceDeleted
+
+            for (int n = 0; n < count; n++)                  // vector section
+            {
+                for (int j = 0; j < dimension; j++) writer.Write(0f);
+            }
+
+            for (int n = 0; n < count; n++)                  // graph section
+            {
+                writer.Write((long)n);                       // id
+                writer.Write(0);                             // level
+                writer.Write(false);                         // deleted
+                writer.Write(1);                             // layer count
+                if (n == 0)
+                {
+                    writer.Write(1);                         // layer 0 link count
+                    writer.Write(neighbor);                  // out-of-range neighbor
+                }
+                else
+                {
+                    writer.Write(0);
+                }
+            }
+        }
+
+        return stream.ToArray();
+    }
+
+    [Fact]
     public void HandlesEdgeCases()
     {
         var index = new HnswIndex(3, DistanceMetric.EuclideanL2, seed: 1);

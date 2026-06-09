@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
 using System.Numerics;
@@ -502,11 +503,9 @@ public sealed class HnswIndex : IDisposable
 
             // Vector section: one normalized vector per slot, contiguous and fixed-stride, so the
             // read path can memory-map it and address slot s at base + s * Dimension * sizeof(float).
-            // Written as raw little-endian float blocks (byte-identical to a per-float loop on the
-            // LE platforms .NET targets, but without millions of scalar writes).
             for (int n = 0; n < _nodes.Count; n++)
             {
-                writer.Write(MemoryMarshal.AsBytes(StoredSpan(n)));
+                WriteFloatsLittleEndian(writer, StoredSpan(n));
             }
 
             // Graph section: per-node metadata and link lists, kept separate from the vectors.
@@ -551,7 +550,7 @@ public sealed class HnswIndex : IDisposable
             // Vector section first (one vector per slot), then the graph section.
             for (int i = 0; i < header.Count; i++)
             {
-                ReadExactInto(reader, MemoryMarshal.AsBytes(index._vectors.VectorMutable(i)));
+                ReadFloatsLittleEndian(reader, index._vectors.VectorMutable(i));
             }
 
             for (int i = 0; i < header.Count; i++)
@@ -584,6 +583,15 @@ public sealed class HnswIndex : IDisposable
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentOutOfRangeException.ThrowIfNegative(baseOffset);
+
+        // The mapped vector section is read as host-endian floats straight off the pages, so it is
+        // only correct on little-endian platforms (the only ones .NET supports). Reject otherwise
+        // rather than return silently wrong results; the stream loader handles big-endian hosts.
+        if (!BitConverter.IsLittleEndian)
+        {
+            throw new PlatformNotSupportedException("Memory-mapped loading is only supported on little-endian platforms.");
+        }
+
         Header header;
         long vectorOffset;
         HnswIndex index;
@@ -664,10 +672,10 @@ public sealed class HnswIndex : IDisposable
             long id = reader.ReadInt64();
             int level = reader.ReadInt32();
             bool deleted = header.Version >= 3 && reader.ReadBoolean();
-            ReadExactInto(reader, MemoryMarshal.AsBytes(index._vectors.VectorMutable(i)));
+            ReadFloatsLittleEndian(reader, index._vectors.VectorMutable(i));
             if (discard.Length > 0)
             {
-                ReadExactInto(reader, MemoryMarshal.AsBytes(discard.AsSpan()));
+                ReadFloatsLittleEndian(reader, discard.AsSpan());
             }
 
             ReadNodeLinks(reader, index, i, id, level, deleted, header);
@@ -686,9 +694,27 @@ public sealed class HnswIndex : IDisposable
         for (int layer = 0; layer < layerCount; layer++)
         {
             int linkCount = reader.ReadInt32();
+
+            // Bound the count by the node total (a slot can have at most Count distinct neighbors)
+            // so a corrupt length cannot drive a huge allocation, then validate every neighbor slot.
+            // Unchecked indices would later reach MappedVectorBlock, which builds a span directly
+            // from a raw pointer with no bounds check, so an out-of-range link could read arbitrary
+            // mapped memory or fault the process instead of throwing.
+            if ((uint)linkCount > (uint)header.Count)
+            {
+                throw new InvalidDataException("Invalid link count in Hnsw.Net index.");
+            }
+
+            List<int> links = node.Links[layer];
             for (int link = 0; link < linkCount; link++)
             {
-                node.Links[layer].Add(reader.ReadInt32());
+                int neighbor = reader.ReadInt32();
+                if ((uint)neighbor >= (uint)header.Count)
+                {
+                    throw new InvalidDataException("Link index out of range in Hnsw.Net index.");
+                }
+
+                links.Add(neighbor);
             }
         }
 
@@ -783,6 +809,37 @@ public sealed class HnswIndex : IDisposable
             }
 
             total += read;
+        }
+    }
+
+    // The on-disk vector section is little-endian. On little-endian hosts (the only platforms .NET
+    // supports) this is a single bulk byte copy; the big-endian fallbacks keep the format portable.
+    private static void WriteFloatsLittleEndian(BinaryWriter writer, ReadOnlySpan<float> values)
+    {
+        if (BitConverter.IsLittleEndian)
+        {
+            writer.Write(MemoryMarshal.AsBytes(values));
+            return;
+        }
+
+        Span<byte> scratch = stackalloc byte[sizeof(float)];
+        foreach (float value in values)
+        {
+            BinaryPrimitives.WriteSingleLittleEndian(scratch, value);
+            writer.Write(scratch);
+        }
+    }
+
+    private static void ReadFloatsLittleEndian(BinaryReader reader, Span<float> destination)
+    {
+        Span<byte> bytes = MemoryMarshal.AsBytes(destination);
+        ReadExactInto(reader, bytes);
+        if (!BitConverter.IsLittleEndian)
+        {
+            for (int i = 0; i < bytes.Length; i += sizeof(float))
+            {
+                bytes.Slice(i, sizeof(float)).Reverse();
+            }
         }
     }
 
