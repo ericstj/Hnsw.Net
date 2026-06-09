@@ -429,8 +429,16 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                 writer.Write(data.Records.Count);
                 foreach (KeyValuePair<object, HnswCollectionData.Entry> kvp in data.Records)
                 {
-                    byte[] keyJson = serializeKey((TKey)kvp.Key);
-                    byte[] recordJson = serializeRecord((TRecord)kvp.Value.Record);
+                    if (kvp.Key is not TKey typedKey || kvp.Value.Record is not TRecord typedRecord)
+                    {
+                        throw new InvalidOperationException(
+                            $"Collection '{Name}' contains an entry whose key or record type does not match " +
+                            $"the '{typeof(TKey).Name}'/'{typeof(TRecord).Name}' used to save it. The same collection " +
+                            "name must always be accessed with a single key and record type.");
+                    }
+
+                    byte[] keyJson = serializeKey(typedKey);
+                    byte[] recordJson = serializeRecord(typedRecord);
                     if (keyJson.Length > MaxPayloadLength || recordJson.Length > MaxPayloadLength)
                     {
                         throw new InvalidOperationException(
@@ -516,6 +524,12 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             hasIndex = reader.ReadBoolean();
         }
 
+        if (entries.Count > 0 && !hasIndex)
+        {
+            throw new InvalidDataException(
+                "Corrupt Hnsw.Net collection snapshot: a non-empty collection has no index.");
+        }
+
         HnswIndex? index = hasIndex ? HnswIndex.Load(stream) : null;
         if (index is not null && (index.Dimension != dimension || index.Metric != metric))
         {
@@ -551,8 +565,17 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                     $"Corrupt Hnsw.Net collection snapshot: the index does not contain a vector for record id {id}.");
             }
 
-            newRecords[key!] = new HnswCollectionData.Entry { Record = record!, Id = id, Vector = vector };
-            newIdToKey[id] = key!;
+            if (!newRecords.TryAdd(key!, new HnswCollectionData.Entry { Record = record!, Id = id, Vector = vector }))
+            {
+                throw new InvalidDataException(
+                    $"Corrupt Hnsw.Net collection snapshot: duplicate record key '{key}'.");
+            }
+
+            if (!newIdToKey.TryAdd(id, key!))
+            {
+                throw new InvalidDataException(
+                    $"Corrupt Hnsw.Net collection snapshot: duplicate record id {id}.");
+            }
         }
 
         // Establish/validate the record type before touching _collections so a concurrent GetCollection

@@ -270,6 +270,57 @@ public partial class VectorStoreTests
         Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
     }
 
+    [Fact]
+    public async Task Load_NonEmptyWithoutIndex_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        bytes[HasIndexOffset(bytes)] = 0; // clear hasIndex on a non-empty snapshot
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    [Fact]
+    public async Task Load_DuplicateRecordId_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        long firstId = BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(28));
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(SecondRecordOffset(bytes)), firstId);
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
+    // Walks the fixed 28-byte header and per-record framing to locate the trailing hasIndex byte.
+    private static int HasIndexOffset(byte[] bytes)
+    {
+        int pos = 24;
+        int count = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+        pos += 4;
+        for (int i = 0; i < count; i++)
+        {
+            pos += 8; // id
+            int keyLen = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+            pos += 4 + keyLen;
+            int recLen = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+            pos += 4 + recLen;
+        }
+
+        return pos;
+    }
+
+    // Offset of the second record's id field (records start at byte 28).
+    private static int SecondRecordOffset(byte[] bytes)
+    {
+        int pos = 28;
+        pos += 8; // first record id
+        int keyLen = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+        pos += 4 + keyLen;
+        int recLen = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(pos));
+        pos += 4 + recLen;
+        return pos;
+    }
+
     private static async Task<byte[]> SaveSnapshotAsync()
     {
         HnswCollection<int, Doc> collection = await SeedAsync();
