@@ -431,6 +431,12 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                 {
                     byte[] keyJson = serializeKey((TKey)kvp.Key);
                     byte[] recordJson = serializeRecord((TRecord)kvp.Value.Record);
+                    if (keyJson.Length > MaxPayloadLength || recordJson.Length > MaxPayloadLength)
+                    {
+                        throw new InvalidOperationException(
+                            $"A serialized key or record exceeds the maximum supported snapshot payload size ({MaxPayloadLength} bytes).");
+                    }
+
                     writer.Write(kvp.Value.Id);
                     writer.Write(keyJson.Length);
                     writer.Write(keyJson);
@@ -549,6 +555,15 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             newIdToKey[id] = key!;
         }
 
+        // Establish/validate the record type before touching _collections so a concurrent GetCollection
+        // with a different TRecord can't slip in and observe mixed-type data for this name.
+        Type existingType = _collectionTypes.GetOrAdd(Name, typeof(TRecord));
+        if (existingType != typeof(TRecord))
+        {
+            throw new InvalidOperationException(
+                $"Collection '{Name}' already exists with data type '{existingType.Name}' and cannot be loaded as data type '{typeof(TRecord).Name}'.");
+        }
+
         // Update the existing per-collection data in place so its Lock object stays stable for any
         // other threads that already captured it via GetData().
         HnswCollectionData data = _collections.GetOrAdd(Name, static _ => new HnswCollectionData());
@@ -569,8 +584,6 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                 data.IdToKey[id] = key!;
             }
         }
-
-        _collectionTypes[Name] = typeof(TRecord);
     }
 
     // An individual key or record payload should never be huge; cap it so a corrupt length prefix on a

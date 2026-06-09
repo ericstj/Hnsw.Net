@@ -1,5 +1,6 @@
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.VectorData;
+using System.Buffers.Binary;
 using System.Text.Json.Serialization;
 using HnswNet;
 using Xunit;
@@ -243,7 +244,7 @@ public partial class VectorStoreTests
     public async Task Load_NegativeHeaderInt32_Throws(int offset, int value)
     {
         byte[] bytes = await SaveSnapshotAsync();
-        BitConverter.GetBytes(value).CopyTo(bytes, offset);
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(offset), value);
 
         var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
         Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
@@ -253,7 +254,7 @@ public partial class VectorStoreTests
     public async Task Load_NegativeNextId_Throws()
     {
         byte[] bytes = await SaveSnapshotAsync();
-        BitConverter.GetBytes(-1L).CopyTo(bytes, 16); // nextId field
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(16), -1L); // nextId field
 
         var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
         Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
@@ -263,7 +264,7 @@ public partial class VectorStoreTests
     public async Task Load_NextIdNotGreaterThanRecordIds_Throws()
     {
         byte[] bytes = await SaveSnapshotAsync();
-        BitConverter.GetBytes(0L).CopyTo(bytes, 16); // nextId <= existing record ids
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(16), 0L); // nextId <= existing record ids
 
         var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
         Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
