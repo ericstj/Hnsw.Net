@@ -494,15 +494,11 @@ public sealed class HnswIndex
                 writer.Write(node.Id);
                 writer.Write(node.Level);
                 writer.Write(node.Deleted);
-                ReadOnlySpan<float> stored = StoredSpan(n);
-                for (int i = 0; i < Dimension; i++)
-                {
-                    writer.Write(stored[i]);
-                }
-                for (int i = 0; i < Dimension; i++)
-                {
-                    writer.Write(node.OriginalVector[i]);
-                }
+                // Vectors are written as raw little-endian float blocks; on the LE platforms .NET
+                // targets this is byte-identical to a per-element BinaryWriter.Write(float) loop but
+                // avoids millions of scalar writes on large indexes.
+                writer.Write(MemoryMarshal.AsBytes(StoredSpan(n)));
+                writer.Write(MemoryMarshal.AsBytes(node.OriginalVector.AsSpan()));
 
                 writer.Write(node.Links.Length);
                 for (int layer = 0; layer < node.Links.Length; layer++)
@@ -554,17 +550,11 @@ public sealed class HnswIndex
             int level = reader.ReadInt32();
             bool deleted = version >= 3 && reader.ReadBoolean();
             Span<float> stored = index._storedVectors.AsSpan(i * dimension, dimension);
-            for (int j = 0; j < dimension; j++)
-            {
-                stored[j] = reader.ReadSingle();
-            }
+            ReadExactInto(reader, MemoryMarshal.AsBytes(stored));
             var originalVector = new float[dimension];
             if (version >= 2)
             {
-                for (int j = 0; j < dimension; j++)
-                {
-                    originalVector[j] = reader.ReadSingle();
-                }
+                ReadExactInto(reader, MemoryMarshal.AsBytes(originalVector.AsSpan()));
             }
             else
             {
@@ -658,6 +648,21 @@ public sealed class HnswIndex
     private ReadOnlySpan<float> StoredSpan(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
 
     private Span<float> StoredSpanMutable(int index) => _storedVectors.AsSpan(index * Dimension, Dimension);
+
+    private static void ReadExactInto(BinaryReader reader, Span<byte> buffer)
+    {
+        int total = 0;
+        while (total < buffer.Length)
+        {
+            int read = reader.Read(buffer.Slice(total));
+            if (read == 0)
+            {
+                throw new EndOfStreamException();
+            }
+
+            total += read;
+        }
+    }
 
     private int RandomLevel()
     {
