@@ -104,7 +104,11 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
     /// <inheritdoc />
     public override Task EnsureCollectionDeletedAsync(CancellationToken cancellationToken = default)
     {
-        _collections.TryRemove(Name, out _);
+        if (_collections.TryRemove(Name, out HnswCollectionData? data))
+        {
+            data.Dispose();
+        }
+
         _collectionTypes.TryRemove(Name, out _);
         return Task.CompletedTask;
     }
@@ -228,7 +232,7 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
 
                 long id = data.NextId++;
                 index.Add(id, vector.Span);
-                data.Records[key] = new HnswCollectionData.Entry { Record = record, Id = id, Vector = vector };
+                data.Records[key] = new HnswCollectionData.Entry(record, id, vector);
                 data.IdToKey[id] = key;
             }
         }
@@ -406,6 +410,46 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         JsonTypeInfo recordInfo = ResolveTypeInfo(context, typeof(TRecord));
         LoadCore(
             stream,
+            json => DeserializeWithTypeInfo<TKey>(json, keyInfo),
+            json => DeserializeWithTypeInfo<TRecord>(json, recordInfo));
+    }
+
+    /// <summary>
+    /// Provider-specific persistence that memory-maps a snapshot file instead of reading it into the managed
+    /// heap. Record payloads are deserialized lazily on first access and the backing vectors are mapped, so a
+    /// large collection loads with minimal time and allocation. The resulting collection is read-only (the
+    /// mapping is released when the store or collection data is disposed) and its records' JSON is validated
+    /// on access rather than at load time.
+    /// </summary>
+    /// <param name="path">The snapshot file path.</param>
+    /// <remarks>
+    /// This overload deserializes records by reflection. For trimmed or NativeAOT applications, use
+    /// <see cref="Load(string, JsonSerializerContext)" /> with a source-generated context.
+    /// </remarks>
+    [RequiresUnreferencedCode("Snapshot persistence serializes records by reflection and is incompatible with trimming. Use the JsonSerializerContext overload for trimming/NativeAOT.")]
+    [RequiresDynamicCode("Snapshot persistence serializes records by reflection and is incompatible with NativeAOT. Use the JsonSerializerContext overload for trimming/NativeAOT.")]
+    public void Load(string path)
+        => LoadMappedCore(path, 0, DeserializeByReflectionSpan<TKey>, DeserializeByReflectionSpan<TRecord>);
+
+    /// <summary>
+    /// Memory-mapping, AOT- and trimming-safe counterpart of <see cref="Load(string)" />, deserializing
+    /// records with the supplied source-generated <paramref name="context" />.
+    /// </summary>
+    public void Load(string path, JsonSerializerContext context)
+        => Load(path, 0, context);
+
+    /// <summary>
+    /// Memory-maps a snapshot that begins at <paramref name="offset" /> within <paramref name="path" />, for
+    /// use when a collection snapshot is embedded in a larger container file.
+    /// </summary>
+    public void Load(string path, long offset, JsonSerializerContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        JsonTypeInfo keyInfo = ResolveTypeInfo(context, typeof(TKey));
+        JsonTypeInfo recordInfo = ResolveTypeInfo(context, typeof(TRecord));
+        LoadMappedCore(
+            path,
+            offset,
             json => DeserializeWithTypeInfo<TKey>(json, keyInfo),
             json => DeserializeWithTypeInfo<TRecord>(json, recordInfo));
     }
@@ -620,7 +664,7 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                     $"Corrupt Hnsw.Net collection snapshot: the index does not contain a vector for record id {id}.");
             }
 
-            if (!newRecords.TryAdd(key!, new HnswCollectionData.Entry { Record = record!, Id = id, Vector = vector }))
+            if (!newRecords.TryAdd(key!, new HnswCollectionData.Entry(record!, id, vector)))
             {
                 throw new InvalidDataException(
                     $"Corrupt Hnsw.Net collection snapshot: duplicate record key '{key}'.");
@@ -633,6 +677,206 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             }
         }
 
+        InstallLoadedState(dimension, nextId, index, mappedRecords: null, newRecords, newIdToKey);
+    }
+
+    private void LoadMappedCore(string path, long baseOffset, SpanReader<TKey> deserializeKey, SpanReader<TRecord> deserializeRecord)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentOutOfRangeException.ThrowIfNegative(baseOffset);
+
+        int dimension;
+        DistanceMetric metric;
+        long nextId;
+        bool hasIndex;
+        long indexOffset;
+        // Framing only: key materialized eagerly (small), record payload located but not read yet.
+        var framed = new List<(TKey Key, long Id, long RecordOffset, int RecordLength)>();
+
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true))
+        {
+            long fileLength = stream.Length;
+            stream.Seek(baseOffset, SeekOrigin.Begin);
+            try
+            {
+                if (reader.ReadUInt32() != SnapshotMagic)
+                {
+                    throw new InvalidDataException("The file is not an Hnsw.Net collection snapshot.");
+                }
+
+                if (reader.ReadInt32() != SnapshotVersion)
+                {
+                    throw new InvalidDataException("Unsupported Hnsw.Net collection snapshot version.");
+                }
+
+                dimension = reader.ReadInt32();
+                metric = (DistanceMetric)reader.ReadInt32();
+                nextId = reader.ReadInt64();
+
+                if (dimension < 0)
+                {
+                    throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative vector dimension.");
+                }
+
+                if (nextId < 0)
+                {
+                    throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative next id.");
+                }
+
+                int configured = _model.VectorProperty.Dimensions;
+                if (configured > 0 && dimension > 0 && dimension != configured)
+                {
+                    throw new InvalidDataException(
+                        $"The snapshot's vector dimension ({dimension}) does not match the collection's configured dimension ({configured}).");
+                }
+
+                if (metric != _metric)
+                {
+                    throw new InvalidDataException(
+                        $"The snapshot's distance metric ({metric}) does not match the collection's configured metric ({_metric}).");
+                }
+
+                int count = reader.ReadInt32();
+                if (count < 0)
+                {
+                    throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative record count.");
+                }
+
+                for (int i = 0; i < count; i++)
+                {
+                    long id = reader.ReadInt64();
+                    TKey key = deserializeKey(ReadExact(reader, reader.ReadInt32()));
+                    int recordLength = reader.ReadInt32();
+                    if (recordLength < 0)
+                    {
+                        throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: negative payload length.");
+                    }
+
+                    if (recordLength > MaxPayloadLength)
+                    {
+                        throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: payload length exceeds the maximum supported size.");
+                    }
+
+                    long recordOffset = stream.Position;
+                    if (recordLength > fileLength - recordOffset)
+                    {
+                        throw new InvalidDataException("Truncated Hnsw.Net collection snapshot.");
+                    }
+
+                    stream.Seek(recordLength, SeekOrigin.Current);
+                    framed.Add((key, id, recordOffset, recordLength));
+                }
+
+                hasIndex = reader.ReadBoolean();
+                indexOffset = stream.Position;
+            }
+            catch (EndOfStreamException ex)
+            {
+                throw new InvalidDataException("Truncated Hnsw.Net collection snapshot.", ex);
+            }
+            catch (JsonException ex)
+            {
+                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: a key payload is not valid JSON.", ex);
+            }
+            catch (NotSupportedException ex)
+            {
+                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: a key payload could not be deserialized.", ex);
+            }
+        }
+
+        if (framed.Count > 0 && !hasIndex)
+        {
+            throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: a non-empty collection has no index.");
+        }
+
+        if (hasIndex && dimension == 0)
+        {
+            throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: an index is present but the vector dimension is zero.");
+        }
+
+        HnswIndex? index = null;
+        MappedRecordFile? mapped = null;
+        try
+        {
+            try
+            {
+                index = hasIndex ? HnswIndex.LoadMapped(path, indexOffset) : null;
+            }
+            catch (Exception ex) when (
+                ex is EndOfStreamException or IOException or OverflowException
+                    or ArgumentException or InvalidOperationException or FormatException
+                && ex is not InvalidDataException)
+            {
+                throw new InvalidDataException("Corrupt Hnsw.Net collection snapshot: the index is invalid.", ex);
+            }
+
+            if (index is not null && (index.Dimension != dimension || index.Metric != metric))
+            {
+                throw new InvalidDataException(
+                    $"Corrupt Hnsw.Net collection snapshot: the index header (dimension {index.Dimension}, metric {index.Metric}) " +
+                    $"does not match the snapshot header (dimension {dimension}, metric {metric}).");
+            }
+
+            mapped = new MappedRecordFile(path);
+
+            var newRecords = new Dictionary<object, HnswCollectionData.Entry>();
+            var newIdToKey = new Dictionary<long, TKey>();
+            foreach ((TKey key, long id, long recordOffset, int recordLength) in framed)
+            {
+                if (id < 0)
+                {
+                    throw new InvalidDataException($"Corrupt Hnsw.Net collection snapshot: negative record id {id}.");
+                }
+
+                if (id >= nextId)
+                {
+                    throw new InvalidDataException(
+                        $"Corrupt Hnsw.Net collection snapshot: record id {id} is not less than the next id ({nextId}).");
+                }
+
+                if (index is not null && !index.Contains(id))
+                {
+                    throw new InvalidDataException(
+                        $"Corrupt Hnsw.Net collection snapshot: the index does not contain a vector for record id {id}.");
+                }
+
+                MappedRecordFile mappedRecords = mapped;
+                long offset = recordOffset;
+                int length = recordLength;
+                object Factory() => deserializeRecord(mappedRecords.Slice(offset, length))!;
+
+                // The mapped index owns the vectors; the collection keeps none on the managed heap.
+                if (!newRecords.TryAdd(key!, new HnswCollectionData.Entry(Factory, id, ReadOnlyMemory<float>.Empty)))
+                {
+                    throw new InvalidDataException($"Corrupt Hnsw.Net collection snapshot: duplicate record key '{key}'.");
+                }
+
+                if (!newIdToKey.TryAdd(id, key))
+                {
+                    throw new InvalidDataException($"Corrupt Hnsw.Net collection snapshot: duplicate record id {id}.");
+                }
+            }
+
+            InstallLoadedState(dimension, nextId, index, mapped, newRecords, newIdToKey);
+            index = null;
+            mapped = null;
+        }
+        finally
+        {
+            mapped?.Dispose();
+            index?.Dispose();
+        }
+    }
+
+    private void InstallLoadedState(
+        int dimension,
+        long nextId,
+        HnswIndex? index,
+        MappedRecordFile? mappedRecords,
+        Dictionary<object, HnswCollectionData.Entry> newRecords,
+        Dictionary<long, TKey> newIdToKey)
+    {
         // Establish/validate the key and record types before touching _collections so a concurrent
         // GetCollection with a different TKey/TRecord can't slip in and observe mixed-type data for this name.
         (Type Key, Type Record) existingType = _collectionTypes.GetOrAdd(Name, (typeof(TKey), typeof(TRecord)));
@@ -647,11 +891,15 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
         HnswCollectionData data = _collections.GetOrAdd(Name, static _ => new HnswCollectionData());
         lock (data.Lock)
         {
+            HnswIndex? supersededIndex = data.Index;
+            MappedRecordFile? supersededMapping = data.MappedRecords;
+
             data.Records.Clear();
             data.IdToKey.Clear();
             data.Dimension = dimension;
             data.NextId = nextId;
             data.Index = index;
+            data.MappedRecords = mappedRecords;
             foreach ((object key, HnswCollectionData.Entry entry) in newRecords)
             {
                 data.Records[key] = entry;
@@ -661,8 +909,20 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             {
                 data.IdToKey[id] = key!;
             }
+
+            if (!ReferenceEquals(supersededIndex, index))
+            {
+                supersededIndex?.Dispose();
+            }
+
+            if (!ReferenceEquals(supersededMapping, mappedRecords))
+            {
+                supersededMapping?.Dispose();
+            }
         }
     }
+
+    private delegate T SpanReader<out T>(ReadOnlySpan<byte> utf8Json);
 
     // An individual key or record payload should never be huge; cap it so a corrupt length prefix on a
     // non-seekable stream cannot trigger a denial-of-service allocation before truncation is detected.
@@ -706,6 +966,11 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
             ? value
             : throw new InvalidDataException($"Invalid Hnsw.Net collection snapshot: could not deserialize a '{typeof(T)}'.");
 
+    private static T DeserializeWithTypeInfo<T>(ReadOnlySpan<byte> json, JsonTypeInfo typeInfo)
+        => JsonSerializer.Deserialize(json, typeInfo) is T value
+            ? value
+            : throw new InvalidDataException($"Invalid Hnsw.Net collection snapshot: could not deserialize a '{typeof(T)}'.");
+
     [RequiresUnreferencedCode("Serializes by reflection.")]
     [RequiresDynamicCode("Serializes by reflection.")]
     private static byte[] SerializeByReflection<T>(T value)
@@ -714,6 +979,12 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
     [RequiresUnreferencedCode("Deserializes by reflection.")]
     [RequiresDynamicCode("Deserializes by reflection.")]
     private static T DeserializeByReflection<T>(byte[] json)
+        => JsonSerializer.Deserialize<T>(json)
+            ?? throw new InvalidDataException("Invalid Hnsw.Net collection snapshot.");
+
+    [RequiresUnreferencedCode("Deserializes by reflection.")]
+    [RequiresDynamicCode("Deserializes by reflection.")]
+    private static T DeserializeByReflectionSpan<T>(ReadOnlySpan<byte> json)
         => JsonSerializer.Deserialize<T>(json)
             ?? throw new InvalidDataException("Invalid Hnsw.Net collection snapshot.");
 

@@ -572,15 +572,25 @@ public sealed class HnswIndex : IDisposable
     /// <see cref="Add(long, ReadOnlySpan{float})" /> throw) and owns the mapping, so it must be disposed.
     /// Only the current on-disk format is supported; re-save older indexes first.
     /// </summary>
-    public static HnswIndex LoadMapped(string path)
+    public static HnswIndex LoadMapped(string path) => LoadMapped(path, 0);
+
+    /// <summary>
+    /// Loads an index that begins at <paramref name="baseOffset" /> within a larger file, memory-mapping
+    /// its vector section. Use this when an index is embedded in a container format (for example a
+    /// collection snapshot). Behaves like <see cref="LoadMapped(string)" /> otherwise: the result is
+    /// read-only, owns the mapping, and must be disposed.
+    /// </summary>
+    public static HnswIndex LoadMapped(string path, long baseOffset)
     {
         ArgumentNullException.ThrowIfNull(path);
+        ArgumentOutOfRangeException.ThrowIfNegative(baseOffset);
         Header header;
         long vectorOffset;
         HnswIndex index;
         using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
         using (var reader = new BinaryReader(stream, System.Text.Encoding.UTF8, leaveOpen: true))
         {
+            stream.Seek(baseOffset, SeekOrigin.Begin);
             header = ReadHeader(reader);
             if (header.Version != FormatVersion)
             {
@@ -706,7 +716,7 @@ public sealed class HnswIndex : IDisposable
         int Count,
         bool AllowReplaceDeleted);
 
-    /// <summary>Releases the memory mapping held by an index loaded via <see cref="LoadMapped" />.</summary>
+    /// <summary>Releases the memory mapping held by an index loaded via <see cref="LoadMapped(string)" />.</summary>
     public void Dispose()
     {
         (_vectors as IDisposable)?.Dispose();
