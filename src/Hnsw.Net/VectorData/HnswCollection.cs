@@ -530,6 +530,12 @@ public class HnswCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord
                 "Corrupt Hnsw.Net collection snapshot: a non-empty collection has no index.");
         }
 
+        if (hasIndex && dimension == 0)
+        {
+            throw new InvalidDataException(
+                "Corrupt Hnsw.Net collection snapshot: an index is present but the vector dimension is zero.");
+        }
+
         HnswIndex? index = hasIndex ? HnswIndex.Load(stream) : null;
         if (index is not null && (index.Dimension != dimension || index.Metric != metric))
         {

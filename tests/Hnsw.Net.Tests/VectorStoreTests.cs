@@ -291,6 +291,16 @@ public partial class VectorStoreTests
         Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
     }
 
+    [Fact]
+    public async Task Load_IndexWithZeroDimension_Throws()
+    {
+        byte[] bytes = await SaveSnapshotAsync();
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(8), 0); // dimension field, snapshot has an index
+
+        var fresh = new HnswVectorStore().GetCollection<int, Doc>("docs");
+        Assert.Throws<InvalidDataException>(() => fresh.Load(new MemoryStream(bytes)));
+    }
+
     // Walks the fixed 28-byte header and per-record framing to locate the trailing hasIndex byte.
     private static int HasIndexOffset(byte[] bytes)
     {
