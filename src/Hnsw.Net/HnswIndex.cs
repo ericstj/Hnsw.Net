@@ -13,7 +13,7 @@ namespace HnswNet;
 /// </summary>
 public sealed class HnswIndex
 {
-    private const int FormatVersion = 3;
+    private const int FormatVersion = 4;
     private const uint Magic = 0x31575348; // HSW1, little-endian.
 
     private readonly List<Node> _nodes = new();
@@ -118,7 +118,9 @@ public sealed class HnswIndex
     public bool AllowReplaceDeleted => _allowReplaceDeleted;
 
     /// <summary>
-    /// Returns copies of the live ids and original vectors, suitable for rebuilding a portable index.
+    /// Returns copies of the live ids and their stored vectors, suitable for rebuilding a portable
+    /// index. For <see cref="DistanceMetric.Cosine" /> the stored vector is unit-normalized, matching
+    /// what the index searches against; re-adding it reproduces the same index.
     /// </summary>
     public IEnumerable<(long Id, float[] Vector)> ExportItems()
     {
@@ -126,11 +128,12 @@ public sealed class HnswIndex
         try
         {
             var items = new List<(long, float[])>(_nodes.Count - _deletedCount);
-            foreach (Node node in _nodes)
+            for (int slot = 0; slot < _nodes.Count; slot++)
             {
+                Node node = _nodes[slot];
                 if (!node.Deleted)
                 {
-                    items.Add((node.Id, (float[])node.OriginalVector.Clone()));
+                    items.Add((node.Id, _vectors.Vector(slot).ToArray()));
                 }
             }
 
@@ -175,7 +178,6 @@ public sealed class HnswIndex
     public void Add(long id, ReadOnlySpan<float> vector)
     {
         ValidateVector(vector);
-        float[] originalVector = vector.ToArray();
         _lock.EnterWriteLock();
         try
         {
@@ -189,7 +191,7 @@ public sealed class HnswIndex
                 int slot = _deletedSlots.Pop();
                 if (_nodes[slot].Deleted && slot != _entryPoint)
                 {
-                    ReplaceSlot(slot, id, originalVector, originalVector);
+                    ReplaceSlot(slot, id, vector);
                     return;
                 }
             }
@@ -197,8 +199,8 @@ public sealed class HnswIndex
             int level = RandomLevel();
             int newIndex = _nodes.Count;
             EnsureStoredCapacity(newIndex + 1);
-            PrepareVectorInto(originalVector, StoredSpanMutable(newIndex));
-            var node = new Node(id, originalVector, level);
+            PrepareVectorInto(vector, StoredSpanMutable(newIndex));
+            var node = new Node(id, level);
             _nodes.Add(node);
             _ids.Add(id, newIndex);
 
@@ -307,7 +309,10 @@ public sealed class HnswIndex
         }
     }
 
-    /// <summary>Gets a copy of the original vector for a live id. Returns false for unknown or deleted ids.</summary>
+    /// <summary>
+    /// Gets a copy of the stored vector for a live id. For <see cref="DistanceMetric.Cosine" /> this
+    /// is the unit-normalized vector. Returns false for unknown or deleted ids.
+    /// </summary>
     public bool TryGetVector(long id, out float[] vector)
     {
         _lock.EnterReadLock();
@@ -315,7 +320,7 @@ public sealed class HnswIndex
         {
             if (_ids.TryGetValue(id, out int slot) && !_nodes[slot].Deleted)
             {
-                vector = (float[])_nodes[slot].OriginalVector.Clone();
+                vector = _vectors.Vector(slot).ToArray();
                 return true;
             }
 
@@ -369,7 +374,7 @@ public sealed class HnswIndex
         }
     }
 
-    private void ReplaceSlot(int slot, long id, ReadOnlySpan<float> vector, float[] originalVector)
+    private void ReplaceSlot(int slot, long id, ReadOnlySpan<float> vector)
     {
         Node node = _nodes[slot];
         for (int layer = 0; layer < node.Links.Length; layer++)
@@ -384,7 +389,6 @@ public sealed class HnswIndex
 
         _ids.Remove(node.Id);
         node.Id = id;
-        node.OriginalVector = originalVector;
         node.Deleted = false;
         _deletedCount--;
         _ids.Add(id, slot);
@@ -500,7 +504,6 @@ public sealed class HnswIndex
                 // targets this is byte-identical to a per-element BinaryWriter.Write(float) loop but
                 // avoids millions of scalar writes on large indexes.
                 writer.Write(MemoryMarshal.AsBytes(StoredSpan(n)));
-                writer.Write(MemoryMarshal.AsBytes(node.OriginalVector.AsSpan()));
 
                 writer.Write(node.Links.Length);
                 for (int layer = 0; layer < node.Links.Length; layer++)
@@ -546,6 +549,10 @@ public sealed class HnswIndex
         var index = new HnswIndex(dimension, metric, m, efConstruction, ef, entryPoint, maxLevel, allowReplaceDeleted);
         index._vectors.EnsureCapacity(count);
 
+        // Formats 2 and 3 stored a second copy of the pre-normalized vector per node; it is read and
+        // discarded since only the (normalized) stored vector is retained now.
+        float[] discard = version is 2 or 3 ? new float[dimension] : Array.Empty<float>();
+
         for (int i = 0; i < count; i++)
         {
             long id = reader.ReadInt64();
@@ -553,17 +560,12 @@ public sealed class HnswIndex
             bool deleted = version >= 3 && reader.ReadBoolean();
             Span<float> stored = index._vectors.VectorMutable(i);
             ReadExactInto(reader, MemoryMarshal.AsBytes(stored));
-            var originalVector = new float[dimension];
-            if (version >= 2)
+            if (discard.Length > 0)
             {
-                ReadExactInto(reader, MemoryMarshal.AsBytes(originalVector.AsSpan()));
-            }
-            else
-            {
-                stored.CopyTo(originalVector);
+                ReadExactInto(reader, MemoryMarshal.AsBytes(discard.AsSpan()));
             }
 
-            var node = new Node(id, originalVector, level) { Deleted = deleted };
+            var node = new Node(id, level) { Deleted = deleted };
             int layerCount = reader.ReadInt32();
             if (layerCount != level + 1)
             {
@@ -912,10 +914,9 @@ public sealed class HnswIndex
 
     private sealed class Node
     {
-        public Node(long id, float[] originalVector, int level)
+        public Node(long id, int level)
         {
             Id = id;
-            OriginalVector = originalVector;
             Level = level;
             Links = new List<int>[level + 1];
             for (int i = 0; i < Links.Length; i++)
@@ -925,8 +926,6 @@ public sealed class HnswIndex
         }
 
         public long Id { get; set; }
-
-        public float[] OriginalVector { get; set; }
 
         public int Level { get; }
 
