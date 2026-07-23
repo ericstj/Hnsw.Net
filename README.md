@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ericstj/Hnsw.Net/main/eng/icon.png" alt="Hnsw.Net logo" width="128" height="128">
+</p>
+
 # Hnsw.Net
 
 A pure C# (`net10.0`), **no native dependency** implementation of HNSW
