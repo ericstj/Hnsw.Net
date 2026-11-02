@@ -7,7 +7,7 @@
   <ItemGroup>
     <PackageVersion Include="Microsoft.Extensions.AI.Abstractions" Version="10.11.0" />
     <PackageVersion Include="Microsoft.Extensions.VectorData.Abstractions" Version="10.11.0" />
-    <PackageVersion Include="System.Numerics.Tensors" Version="10.0.13" />
+    <PackageVersion Include="System.Numerics.Tensors" Version="10.0.14" />
   </ItemGroup>
 
   <ItemGroup Label="Tests">
